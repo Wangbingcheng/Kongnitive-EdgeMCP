@@ -115,6 +115,7 @@ static i2c_master_dev_handle_t i2c_get_device(uint16_t addr)
 
 extern const uint8_t default_di_container_lua_start[] asm("_binary_default_di_container_lua_start");
 extern const uint8_t default_provider_ssd1306_lua_start[] asm("_binary_default_provider_ssd1306_lua_start");
+extern const uint8_t default_provider_sensor_lua_start[] asm("_binary_default_provider_sensor_lua_start");
 extern const uint8_t default_bindings_lua_start[] asm("_binary_default_bindings_lua_start");
 extern const uint8_t default_main_lua_start[] asm("_binary_default_main_lua_start");
 
@@ -181,6 +182,12 @@ static esp_err_t write_default_script(void)
     if (ret != ESP_OK) {
         return ret;
     }
+
+    ret = write_script_if_missing("provider_sensor.lua", (const char *)default_provider_sensor_lua_start);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
 
     ret = write_script_if_missing("bindings.lua", (const char *)default_bindings_lua_start);
     if (ret != ESP_OK) {
