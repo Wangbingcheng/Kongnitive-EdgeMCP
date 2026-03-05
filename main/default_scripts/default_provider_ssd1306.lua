@@ -21,8 +21,8 @@ end
 function P.factory(opts, _container)
     opts = opts or {}
     local addr = opts.addr or 0x3C
-    local sda = opts.sda or 5
-    local scl = opts.scl or 6
+    local sda = opts.sda or 0
+    local scl = opts.scl or 1
     local freq = opts.freq or 400000
 
     local o = {}

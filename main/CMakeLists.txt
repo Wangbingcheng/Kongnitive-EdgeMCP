@@ -8,6 +8,6 @@ idf_component_register(SRCS "wifi_manager.c" "mcp_server.c" "mcp_tools.c" "mcp_p
                                    "certs/prvtkey.pem"
                                    "default_scripts/default_di_container.lua"
                                    "default_scripts/default_provider_ssd1306.lua"
-                                   "default_scripts/default_provider_sensor.lua"
+                                   "default_scripts/default_provider_sht40.lua"
                                    "default_scripts/default_bindings.lua"
                                    "default_scripts/default_main.lua")

@@ -10,12 +10,18 @@ for iface, cfg in pairs(bindings) do
     local provider_module = "provider_" .. provider_name
     di_container.provide(provider_name, require(provider_module).factory)
     di_container.bind(iface, provider_name, cfg.opts)
+    instances[iface] = di_container.resolve(iface)
 end
 
 local sensor
 for iface, instance in pairs(instances) do
+    log.info("Checking instance:", iface, instance)
     if type(instance.read) == "function" then
         sensor = instance
+        log.info("Found sensor, calling init...")
+        if sensor.init then
+            sensor:init()
+        end
         break
     end
 end
@@ -155,8 +161,10 @@ while true do
     local lua_kb = collectgarbage("count")
     local uptime_sec = system.uptime() or 0
     
-    if uptime_sec - last_sensor_read >= 5 then
+    if uptime_sec - last_sensor_read >= 1 then
+        log.info("Reading sensor...")
         local data = sensor:read()
+        log.info("Sensor data:", data)
         if data then
             temp = string.format("%.1f", data.temperature)
             hum = string.format("%.1f", data.humidity)
@@ -171,5 +179,5 @@ while true do
         heap_free / 1024, runtime_used / 1024, lua_kb, math.floor(uptime_sec + 0.5),
         temp, hum))
     
-    time.sleep_ms(1000)
+    time.sleep_ms(5000)
 end

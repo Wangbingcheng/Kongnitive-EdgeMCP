@@ -80,6 +80,7 @@ static void *lua_tracking_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
 #define I2C_WRITE_BUF_SZ 256
 #define I2C_READ_BUF_SZ  256
 #define I2C_TIMEOUT_MS   100
+#define I2C_SCAN_TIMEOUT_MS 50
 
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static uint32_t i2c_bus_freq = 400000;
@@ -115,7 +116,7 @@ static i2c_master_dev_handle_t i2c_get_device(uint16_t addr)
 
 extern const uint8_t default_di_container_lua_start[] asm("_binary_default_di_container_lua_start");
 extern const uint8_t default_provider_ssd1306_lua_start[] asm("_binary_default_provider_ssd1306_lua_start");
-extern const uint8_t default_provider_sensor_lua_start[] asm("_binary_default_provider_sensor_lua_start");
+extern const uint8_t default_provider_sht40_lua_start[] asm("_binary_default_provider_sht40_lua_start");
 extern const uint8_t default_bindings_lua_start[] asm("_binary_default_bindings_lua_start");
 extern const uint8_t default_main_lua_start[] asm("_binary_default_main_lua_start");
 
@@ -126,7 +127,7 @@ static esp_err_t spiffs_init(void)
     esp_vfs_spiffs_conf_t conf = {
         .base_path = SPIFFS_BASE_PATH,
         .partition_label = "storage",
-        .max_files = 5,
+        .max_files = 6,
         .format_if_mount_failed = true,
     };
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
@@ -183,7 +184,7 @@ static esp_err_t write_default_script(void)
         return ret;
     }
 
-    ret = write_script_if_missing("provider_sensor.lua", (const char *)default_provider_sensor_lua_start);
+    ret = write_script_if_missing("provider_sht40.lua", (const char *)default_provider_sht40_lua_start);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -462,11 +463,39 @@ static int l_i2c_write_read(lua_State *L)
     return 1;
 }
 
+static int l_i2c_scan(lua_State *L)
+{
+    if (!i2c_bus_handle) {
+        return luaL_error(L, "i2c not initialized");
+    }
+
+    lua_createtable(L, 0, 0);
+    int found = 0;
+    for (int addr = 1; addr < 127; addr++) {
+        uint8_t dummy = 0;
+        i2c_device_config_t cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = i2c_bus_freq,
+        };
+        i2c_master_dev_handle_t dev = NULL;
+        if (i2c_master_bus_add_device(i2c_bus_handle, &cfg, &dev) == ESP_OK) {
+            esp_err_t ret = i2c_master_probe(i2c_bus_handle, addr, I2C_SCAN_TIMEOUT_MS);
+            if (ret == ESP_OK) {
+                lua_pushinteger(L, addr);
+                lua_rawseti(L, -2, ++found);
+            }
+        }
+    }
+    return 1;
+}
+
 static const luaL_Reg i2c_lib[] = {
     {"setup",      l_i2c_setup},
     {"write",      l_i2c_write},
     {"read",       l_i2c_read},
     {"write_read", l_i2c_write_read},
+    {"scan",       l_i2c_scan},
     {NULL, NULL}
 };
 
