@@ -195,23 +195,35 @@ static esp_err_t stop_mcp_server(httpd_handle_t server)
 static void disconnect_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    httpd_handle_t *server = (httpd_handle_t *)arg;
-    if (*server) {
-        if (stop_mcp_server(*server) == ESP_OK) {
-            *server = NULL;
+    struct {
+        httpd_handle_t https;
+        httpd_handle_t http;
+    } *servers = (void *)arg;
+
+    if (servers->https) {
+        if (stop_mcp_server(servers->https) == ESP_OK) {
+            servers->https = NULL;
         } else {
-            ESP_LOGE(TAG, "Failed to stop server");
+            ESP_LOGE(TAG, "Failed to stop HTTPS server");
         }
+    }
+    if (servers->http) {
+        httpd_stop(servers->http);
+        servers->http = NULL;
     }
 }
 
 static void connect_handler(void *arg, esp_event_base_t event_base,
                             int32_t event_id, void *event_data)
 {
-    httpd_handle_t *server = (httpd_handle_t *)arg;
-    if (*server == NULL) {
-        *server = start_mcp_server();
-        start_http_server();
+    struct {
+        httpd_handle_t https;
+        httpd_handle_t http;
+    } *servers = (void *)arg;
+
+    if (servers->https == NULL) {
+        servers->https = start_mcp_server();
+        servers->http = start_http_server();
     }
 }
 
@@ -219,7 +231,10 @@ static void connect_handler(void *arg, esp_event_base_t event_base,
 
 void app_main(void)
 {
-    static httpd_handle_t server = NULL;
+    static struct {
+        httpd_handle_t https;
+        httpd_handle_t http;
+    } servers = {0};
 
     /* Initialize log capture first, before anything else logs */
     mcp_log_init();
@@ -240,16 +255,16 @@ void app_main(void)
     }
 
     /* Register WiFi reconnection handlers */
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &servers));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &servers));
 
     /* Initialize OTA subsystem (auto-confirm timer if needed) */
     mcp_ota_init();
 
     /* Start servers only if WiFi is connected; otherwise connect_handler will start them later */
     if (wifi_result == ESP_OK) {
-        server = start_mcp_server();
-        start_http_server();
+        servers.https = start_mcp_server();
+        servers.http = start_http_server();
     }
 
     /* Initialize and start Lua scripting runtime */
