@@ -2,12 +2,13 @@ idf_component_register(SRCS "wifi_manager.c" "mcp_server.c" "mcp_tools.c" "mcp_p
                             "mcp_log.c" "mcp_ota.c" "lua_runtime.c"
                     INCLUDE_DIRS "."
                     PRIV_REQUIRES esp_https_server nvs_flash esp_timer esp_netif esp_eth esp_wifi
-                                  esp_http_client app_update json esp_driver_gpio esp_driver_i2c
+                                  esp_http_client app_update json esp_driver_gpio esp_driver_i2c esp_driver_spi
                                   spiffs lua
                     EMBED_TXTFILES "certs/servercert.pem"
                                    "certs/prvtkey.pem"
                                    "default_scripts/default_di_container.lua"
                                    "default_scripts/default_provider_ssd1306.lua"
+                                   "default_scripts/default_provider_st7735.lua"
                                    "default_scripts/default_provider_sht40.lua"
                                    "default_scripts/default_bindings.lua"
                                    "default_scripts/default_main.lua")

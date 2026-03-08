@@ -16,8 +16,10 @@
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <esp_spiffs.h>
+#include <esp_heap_caps.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
+#include <driver/spi_master.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -116,6 +118,7 @@ static i2c_master_dev_handle_t i2c_get_device(uint16_t addr)
 
 extern const uint8_t default_di_container_lua_start[] asm("_binary_default_di_container_lua_start");
 extern const uint8_t default_provider_ssd1306_lua_start[] asm("_binary_default_provider_ssd1306_lua_start");
+extern const uint8_t default_provider_st7735_lua_start[] asm("_binary_default_provider_st7735_lua_start");
 extern const uint8_t default_provider_sht40_lua_start[] asm("_binary_default_provider_sht40_lua_start");
 extern const uint8_t default_bindings_lua_start[] asm("_binary_default_bindings_lua_start");
 extern const uint8_t default_main_lua_start[] asm("_binary_default_main_lua_start");
@@ -180,6 +183,11 @@ static esp_err_t write_default_script(void)
     }
 
     ret = write_script_if_missing("provider_ssd1306.lua", (const char *)default_provider_ssd1306_lua_start);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = write_script_if_missing("provider_st7735.lua", (const char *)default_provider_st7735_lua_start);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -489,6 +497,649 @@ static int l_i2c_scan(lua_State *L)
     return 1;
 }
 
+/* ── Lua C bindings: spi ────────────────────────────────────────── */
+
+#define SPI_WRITE_BUF_SZ 4096
+#define SPI_READ_BUF_SZ 4096
+#define SPI_TIMEOUT_MS  1000
+
+static spi_device_handle_t spi_handle = NULL;
+static int spi_dc_pin = -1;
+static int spi_res_pin = -1;
+
+static int l_spi_setup(lua_State *L)
+{
+    int mosi = luaL_checkinteger(L, 1);
+    int clk = luaL_checkinteger(L, 2);
+    int cs = luaL_optinteger(L, 3, -1);
+    int dc = luaL_optinteger(L, 4, -1);
+    int res = luaL_optinteger(L, 5, -1);
+    int freq = luaL_optinteger(L, 6, 1000000);
+
+    if (spi_handle) {
+        spi_bus_remove_device(spi_handle);
+        spi_handle = NULL;
+    }
+
+    spi_dc_pin = dc;
+    spi_res_pin = res;
+
+    if (dc >= 0) {
+        gpio_set_direction(dc, GPIO_MODE_OUTPUT);
+        gpio_set_level(dc, 0);  /* DC=0 for command mode initially */
+        ESP_LOGI(TAG, "SPI DC pin=%d initialized", dc);
+    }
+    if (res >= 0) {
+        gpio_set_direction(res, GPIO_MODE_OUTPUT);
+        gpio_set_level(res, 1);
+        gpio_set_level(res, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level(res, 1);
+        ESP_LOGI(TAG, "SPI RES pin=%d initialized", res);
+    }
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = mosi,
+        .miso_io_num = -1,
+        .sclk_io_num = clk,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = SPI_WRITE_BUF_SZ,
+    };
+
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "spi.setup bus failed: %s", esp_err_to_name(ret));
+    }
+
+    spi_device_interface_config_t dev_cfg = {
+        .command_bits = 0,
+        .address_bits = 0,
+        .dummy_bits = 0,
+        .mode = 0,
+        .duty_cycle_pos = 128,
+        .cs_ena_pretrans = 0,
+        .cs_ena_posttrans = 0,
+        .clock_speed_hz = freq,
+        .input_delay_ns = 0,
+        .spics_io_num = cs,
+        .flags = 0,
+        .queue_size = 1,
+    };
+
+    ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "spi.setup add device failed: %s", esp_err_to_name(ret));
+    }
+
+    return 0;
+}
+
+static int l_spi_transfer(lua_State *L)
+{
+    if (!spi_handle) {
+        return luaL_error(L, "spi not initialized");
+    }
+
+    int nargs = lua_gettop(L);
+    uint8_t tx_buf[SPI_WRITE_BUF_SZ];
+    int tx_len = 0;
+
+    for (int i = 1; i <= nargs && tx_len < SPI_WRITE_BUF_SZ; i++) {
+        if (lua_isinteger(L, i)) {
+            tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, i);
+        } else if (lua_isstring(L, i)) {
+            size_t slen;
+            const char *s = lua_tolstring(L, i, &slen);
+            for (size_t j = 0; j < slen && tx_len < SPI_WRITE_BUF_SZ; j++) {
+                tx_buf[tx_len++] = (uint8_t)s[j];
+            }
+        } else if (lua_istable(L, i)) {
+            int tlen = luaL_len(L, i);
+            for (int j = 1; j <= tlen && tx_len < SPI_WRITE_BUF_SZ; j++) {
+                lua_rawgeti(L, i, j);
+                tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, -1);
+                lua_pop(L, 1);
+            }
+        }
+    }
+
+    int rx_len = tx_len;
+    uint8_t rx_buf[SPI_READ_BUF_SZ];
+
+    spi_transaction_t t = {
+        .tx_buffer = tx_buf,
+        .rx_buffer = rx_buf,
+        .length = tx_len * 8,
+        .rxlength = rx_len * 8,
+    };
+
+    esp_err_t ret = spi_device_transmit(spi_handle, &t);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "spi.transfer failed: %s", esp_err_to_name(ret));
+    }
+
+    lua_createtable(L, rx_len, 0);
+    for (int i = 0; i < rx_len; i++) {
+        lua_pushinteger(L, rx_buf[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+static int l_spi_write(lua_State *L)
+{
+    if (!spi_handle) {
+        return luaL_error(L, "spi not initialized");
+    }
+
+    int dc_value = luaL_optinteger(L, 1, 1);
+    int nargs = lua_gettop(L);
+
+    if (spi_dc_pin >= 0) {
+        gpio_set_level(spi_dc_pin, dc_value);
+        ESP_LOGD(TAG, "spi.write: dc_pin=%d value=%d", spi_dc_pin, dc_value);
+    }
+
+    uint8_t tx_buf[SPI_WRITE_BUF_SZ];
+    int tx_len = 0;
+
+    for (int i = 2; i <= nargs && tx_len < SPI_WRITE_BUF_SZ; i++) {
+        if (lua_isinteger(L, i)) {
+            tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, i);
+        } else if (lua_isstring(L, i)) {
+            size_t slen;
+            const char *s = lua_tolstring(L, i, &slen);
+            for (size_t j = 0; j < slen && tx_len < SPI_WRITE_BUF_SZ; j++) {
+                tx_buf[tx_len++] = (uint8_t)s[j];
+            }
+        } else if (lua_istable(L, i)) {
+            int tlen = luaL_len(L, i);
+            for (int j = 1; j <= tlen && tx_len < SPI_WRITE_BUF_SZ; j++) {
+                lua_rawgeti(L, i, j);
+                tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, -1);
+                lua_pop(L, 1);
+            }
+        }
+    }
+
+    spi_transaction_t t = {
+        .tx_buffer = tx_buf,
+        .length = tx_len * 8,
+    };
+
+    esp_err_t ret = spi_device_transmit(spi_handle, &t);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "spi.write failed: %s", esp_err_to_name(ret));
+    }
+    ESP_LOGD(TAG, "spi.write dc=%d len=%d", dc_value, tx_len);
+    return 0;
+}
+
+static int l_spi_dc(lua_State *L)
+{
+    int value = luaL_checkinteger(L, 1);
+    if (spi_dc_pin >= 0) {
+        gpio_set_level(spi_dc_pin, value);
+    }
+    return 0;
+}
+
+/* ── Lua C bindings: lcd (ST7735) with double buffering ─────────── */
+
+#define LCD_WIDTH  160
+#define LCD_HEIGHT 80
+
+static int lcd_dc_pin = -1;
+static int lcd_cs_pin = -1;
+static int lcd_res_pin = -1;
+static int lcd_bl_pin = -1;
+static uint16_t *lcd_framebuf = NULL;
+
+/* 8x8 font (95 characters: 0x20-0x7E) */
+static const uint8_t FONT_8X8[95][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
+    {0x6C,0x6C,0x6C,0x00,0x00,0x00,0x00,0x00},
+    {0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C,0x00},
+    {0x18,0x3E,0x60,0x3C,0x06,0x7C,0x18,0x00},
+    {0x00,0xC6,0xCC,0x18,0x30,0x66,0xC6,0x00},
+    {0x38,0x6C,0x38,0x76,0xDC,0xCC,0x76,0x00},
+    {0x18,0x18,0x30,0x00,0x00,0x00,0x00,0x00},
+    {0x0C,0x18,0x30,0x30,0x30,0x18,0x0C,0x00},
+    {0x30,0x18,0x0C,0x0C,0x0C,0x18,0x30,0x00},
+    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00},
+    {0x00,0x18,0x18,0x7E,0x18,0x18,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x30},
+    {0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00},
+    {0x06,0x0C,0x18,0x30,0x60,0xC0,0x80,0x00},
+    {0x7C,0xC6,0xCE,0xD6,0xE6,0xC6,0x7C,0x00},
+    {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00},
+    {0x7C,0xC6,0x06,0x1C,0x30,0x66,0xFE,0x00},
+    {0x7C,0xC6,0x06,0x3C,0x06,0xC6,0x7C,0x00},
+    {0x1C,0x3C,0x6C,0xCC,0xFE,0x0C,0x1E,0x00},
+    {0xFE,0xC0,0xC0,0xFC,0x06,0xC6,0x7C,0x00},
+    {0x38,0x60,0xC0,0xFC,0xC6,0xC6,0x7C,0x00},
+    {0xFE,0xC6,0x0C,0x18,0x30,0x30,0x30,0x00},
+    {0x7C,0xC6,0xC6,0x7C,0xC6,0xC6,0x7C,0x00},
+    {0x7C,0xC6,0xC6,0x7E,0x06,0x0C,0x78,0x00},
+    {0x00,0x18,0x18,0x00,0x00,0x18,0x18,0x00},
+    {0x00,0x18,0x18,0x00,0x00,0x18,0x18,0x30},
+    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00},
+    {0x00,0x00,0x7E,0x00,0x7E,0x00,0x00,0x00},
+    {0x60,0x30,0x18,0x0C,0x18,0x30,0x60,0x00},
+    {0x7C,0xC6,0x0C,0x18,0x18,0x00,0x18,0x00},
+    {0x7C,0xC6,0xDE,0xDE,0xDE,0xC0,0x78,0x00},
+    {0x38,0x6C,0xC6,0xC6,0xFE,0xC6,0xC6,0x00},
+    {0xFC,0x66,0x66,0x7C,0x66,0x66,0xFC,0x00},
+    {0x3C,0x66,0xC0,0xC0,0xC0,0x66,0x3C,0x00},
+    {0xF8,0x6C,0x66,0x66,0x66,0x6C,0xF8,0x00},
+    {0xFE,0x62,0x68,0x78,0x68,0x62,0xFE,0x00},
+    {0xFE,0x62,0x68,0x78,0x68,0x60,0xF0,0x00},
+    {0x3C,0x66,0xC0,0xC0,0xCE,0x66,0x3A,0x00},
+    {0xC6,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0x00},
+    {0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0x00},
+    {0x1E,0x0C,0x0C,0x0C,0xCC,0xCC,0x78,0x00},
+    {0xE6,0x66,0x6C,0x78,0x6C,0x66,0xE6,0x00},
+    {0xF0,0x60,0x60,0x60,0x62,0x66,0xFE,0x00},
+    {0xC6,0xEE,0xFE,0xFE,0xD6,0xC6,0xC6,0x00},
+    {0xC6,0xE6,0xF6,0xDE,0xCE,0xC6,0xC6,0x00},
+    {0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00},
+    {0xFC,0x66,0x66,0x7C,0x60,0x60,0xF0,0x00},
+    {0x7C,0xC6,0xC6,0xC6,0xC6,0xCE,0x7C,0x0E},
+    {0xFC,0x66,0x66,0x7C,0x6C,0x66,0xE6,0x00},
+    {0x7C,0xC6,0xE0,0x70,0x1C,0xC6,0x7C,0x00},
+    {0x7E,0x7E,0x5A,0x18,0x18,0x18,0x3C,0x00},
+    {0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00},
+    {0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x10,0x00},
+    {0xC6,0xC6,0xC6,0xD6,0xFE,0xEE,0xC6,0x00},
+    {0xC6,0xC6,0x6C,0x38,0x6C,0xC6,0xC6,0x00},
+    {0x66,0x66,0x66,0x3C,0x18,0x18,0x3C,0x00},
+    {0xFE,0xC6,0x8C,0x18,0x32,0x66,0xFE,0x00},
+    {0x3C,0x30,0x30,0x30,0x30,0x30,0x3C,0x00},
+    {0xC0,0x60,0x30,0x18,0x0C,0x06,0x02,0x00},
+    {0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0x00},
+    {0x10,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF},
+    {0x30,0x18,0x0C,0x00,0x00,0x00,0x00,0x00},
+    {0x00,0x00,0x78,0x0C,0x7C,0xCC,0x76,0x00},
+    {0xE0,0x60,0x7C,0x66,0x66,0x66,0xDC,0x00},
+    {0x00,0x00,0x7C,0xC6,0xC0,0xC6,0x7C,0x00},
+    {0x1C,0x0C,0x7C,0xCC,0xCC,0xCC,0x76,0x00},
+    {0x00,0x00,0x7C,0xC6,0xFE,0xC0,0x7C,0x00},
+    {0x38,0x6C,0x64,0xF0,0x60,0x60,0xF0,0x00},
+    {0x00,0x00,0x76,0xCC,0xCC,0x7C,0x0C,0xF8},
+    {0xE0,0x60,0x6C,0x76,0x66,0x66,0xE6,0x00},
+    {0x18,0x00,0x38,0x18,0x18,0x18,0x3C,0x00},
+    {0x06,0x00,0x06,0x06,0x06,0x66,0x66,0x3C},
+    {0xE0,0x60,0x66,0x6C,0x78,0x6C,0xE6,0x00},
+    {0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00},
+    {0x00,0x00,0xEC,0xFE,0xD6,0xD6,0xD6,0x00},
+    {0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x00},
+    {0x00,0x00,0x7C,0xC6,0xC6,0xC6,0x7C,0x00},
+    {0x00,0x00,0xDC,0x66,0x66,0x7C,0x60,0xF0},
+    {0x00,0x00,0x76,0xCC,0xCC,0x7C,0x0C,0x1E},
+    {0x00,0x00,0xDC,0x76,0x60,0x60,0xF0,0x00},
+    {0x00,0x00,0x7E,0xC0,0x7C,0x06,0xFC,0x00},
+    {0x30,0x30,0xFC,0x30,0x30,0x36,0x1C,0x00},
+    {0x00,0x00,0xCC,0xCC,0xCC,0xCC,0x76,0x00},
+    {0x00,0x00,0xC6,0xC6,0xC6,0x6C,0x38,0x00},
+    {0x00,0x00,0xC6,0xD6,0xD6,0xFE,0x6C,0x00},
+    {0x00,0x00,0xC6,0x6C,0x38,0x6C,0xC6,0x00},
+    {0x00,0x00,0xC6,0xC6,0xC6,0x7E,0x06,0xFC},
+    {0x00,0x00,0x7E,0x4C,0x18,0x32,0x7E,0x00},
+    {0x0E,0x18,0x18,0x70,0x18,0x18,0x0E,0x00},
+    {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00},
+    {0x70,0x18,0x18,0x0E,0x18,0x18,0x70,0x00},
+    {0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00},
+};
+
+/* Frame buffer helper functions */
+static inline uint16_t swap_bytes(uint16_t val)
+{
+    return (val >> 8) | (val << 8);
+}
+
+static inline void fb_set_pixel(int x, int y, uint16_t color)
+{
+    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT && lcd_framebuf) {
+        lcd_framebuf[y * LCD_WIDTH + x] = swap_bytes(color);
+    }
+}
+
+static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > LCD_WIDTH) w = LCD_WIDTH - x;
+    if (y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
+    if (w <= 0 || h <= 0) return;
+    
+    uint16_t swapped = swap_bytes(color);
+    for (int py = y; py < y + h; py++) {
+        for (int px = x; px < x + w; px++) {
+            lcd_framebuf[py * LCD_WIDTH + px] = swapped;
+        }
+    }
+}
+
+static void fb_draw_char(int x, int y, char c, uint16_t fg, int has_bg, uint16_t bg, int scale)
+{
+    int idx = c - ' ';
+    if (idx < 0 || idx >= 95) return;
+    
+    for (int row = 0; row < 8; row++) {
+        uint8_t line = FONT_8X8[idx][row];
+        for (int col = 0; col < 8; col++) {
+            int is_fg = (line & (0x80 >> col)) != 0;
+            
+            if (!is_fg && !has_bg) continue;
+            
+            uint16_t color = is_fg ? fg : bg;
+            int px = x + col * scale;
+            int py = y + row * scale;
+            
+            for (int sy = 0; sy < scale; sy++) {
+                for (int sx = 0; sx < scale; sx++) {
+                    fb_set_pixel(px + sx, py + sy, color);
+                }
+            }
+        }
+    }
+}
+
+static void lcd_send_cmd(uint8_t cmd)
+{
+    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 0);
+    gpio_set_level(lcd_dc_pin, 0);
+    spi_transaction_t t = {
+        .tx_buffer = &cmd,
+        .length = 8,
+    };
+    esp_err_t ret = spi_device_transmit(spi_handle, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "lcd_send_cmd failed: %d", ret);
+    }
+}
+
+static void lcd_send_data(uint8_t data)
+{
+    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 0);
+    gpio_set_level(lcd_dc_pin, 1);
+    spi_transaction_t t = {
+        .tx_buffer = &data,
+        .length = 8,
+    };
+    esp_err_t ret = spi_device_transmit(spi_handle, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "lcd_send_data failed: %d", ret);
+    }
+    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 1);
+}
+
+static void lcd_send_buffer(const uint8_t *data, int len)
+{
+    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 0);
+    gpio_set_level(lcd_dc_pin, 1);
+    spi_transaction_t t = {
+        .tx_buffer = data,
+        .length = len * 8,
+    };
+    spi_device_transmit(spi_handle, &t);
+    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 1);
+}
+
+static void lcd_set_addr(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
+{
+    uint8_t x_offset = 0;
+    uint8_t y_offset = 24;
+    uint8_t data[4];
+
+    lcd_send_cmd(0x2A);
+    data[0] = 0; data[1] = x + x_offset;
+    data[2] = 0; data[3] = x + w - 1 + x_offset;
+    for (int i = 0; i < 4; i++) lcd_send_data(data[i]);
+
+    lcd_send_cmd(0x2B);
+    data[0] = 0; data[1] = y + y_offset;
+    data[2] = 0; data[3] = y + h - 1 + y_offset;
+    for (int i = 0; i < 4; i++) lcd_send_data(data[i]);
+
+    lcd_send_cmd(0x2C);
+}
+
+static int l_lcd_setup(lua_State *L)
+{
+    int mosi = luaL_checkinteger(L, 1);
+    int clk = luaL_checkinteger(L, 2);
+    int cs = luaL_optinteger(L, 3, -1);
+    int dc = luaL_optinteger(L, 4, 10);
+    int res = luaL_optinteger(L, 5, 6);
+    int bl = luaL_optinteger(L, 6, 11);
+    int freq = luaL_optinteger(L, 7, 20000000);
+    (void)freq;
+
+    lcd_cs_pin = cs;
+    lcd_dc_pin = dc;
+    lcd_res_pin = res;
+    lcd_bl_pin = bl;
+
+    ESP_LOGI(TAG, "ST7735: mosi=%d clk=%d cs=%d dc=%d res=%d bl=%d", mosi, clk, cs, dc, res, bl);
+
+    if (spi_handle) {
+        spi_bus_remove_device(spi_handle);
+        spi_handle = NULL;
+    }
+
+    if (dc >= 0) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << dc),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(dc, 0);
+    }
+    if (res >= 0) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << res),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+    }
+    if (bl >= 0) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << bl),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+    }
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = mosi,
+        .miso_io_num = -1,
+        .sclk_io_num = clk,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32768,
+    };
+
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
+    }
+
+    spi_device_interface_config_t dev_cfg = {
+        .command_bits = 0,
+        .address_bits = 0,
+        .dummy_bits = 0,
+        .mode = 0,
+        .duty_cycle_pos = 128,
+        .cs_ena_pretrans = 0,
+        .cs_ena_posttrans = 0,
+        .clock_speed_hz = 20000000,
+        .input_delay_ns = 0,
+        .spics_io_num = cs,
+        .flags = 0,
+        .queue_size = 1,
+    };
+
+    ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup add device failed: %s", esp_err_to_name(ret));
+    }
+
+    gpio_set_level(res, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(res, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "ST7735: RESET done");
+
+    lcd_send_cmd(0x01);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_LOGI(TAG, "ST7735: SWRESET done");
+
+    lcd_send_cmd(0x11);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "ST7735: SLPOUT done");
+
+    lcd_send_cmd(0x3A);
+    lcd_send_data(0x05);
+    ESP_LOGI(TAG, "ST7735: COLMOD done");
+
+    lcd_send_cmd(0x36);
+    lcd_send_data(0x68);
+    ESP_LOGI(TAG, "ST7735: MADCTL done");
+
+    lcd_send_cmd(0x13);
+    ESP_LOGI(TAG, "ST7735: NORON done");
+
+    lcd_send_cmd(0x29);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "ST7735: DISPON done");
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (lcd_bl_pin >= 0) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << lcd_bl_pin),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(lcd_bl_pin, 1);
+        ESP_LOGI(TAG, "ST7735: Backlight ON");
+    }
+
+    if (lcd_framebuf == NULL) {
+        lcd_framebuf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
+        if (lcd_framebuf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate frame buffer");
+            return luaL_error(L, "lcd.setup: frame buffer allocation failed");
+        }
+        memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
+    }
+    
+    ESP_LOGI(TAG, "ST7735 LCD initialized (frame buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2);
+    return 0;
+}
+
+static int l_lcd_clear(lua_State *L)
+{
+    int color = luaL_optinteger(L, 1, 0);
+    if (!lcd_framebuf) return 0;
+    
+    uint16_t swapped = swap_bytes(color);
+    for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
+        lcd_framebuf[i] = swapped;
+    }
+    return 0;
+}
+
+static int l_lcd_fill(lua_State *L)
+{
+    int x = luaL_checkinteger(L, 1);
+    int y = luaL_checkinteger(L, 2);
+    int w = luaL_checkinteger(L, 3);
+    int h = luaL_checkinteger(L, 4);
+    int color = luaL_checkinteger(L, 5);
+    
+    fb_fill_rect(x, y, w, h, color);
+    return 0;
+}
+
+static int l_lcd_pixel(lua_State *L)
+{
+    int x = luaL_checkinteger(L, 1);
+    int y = luaL_checkinteger(L, 2);
+    int color = luaL_checkinteger(L, 3);
+    
+    fb_set_pixel(x, y, color);
+    return 0;
+}
+
+static int l_lcd_print(lua_State *L)
+{
+    int x = luaL_checkinteger(L, 1);
+    int y = luaL_checkinteger(L, 2);
+    const char *str = luaL_checkstring(L, 3);
+    int fg_color = luaL_optinteger(L, 4, 0xFFFF);
+    int has_bg = !lua_isnoneornil(L, 5);
+    int bg_color = has_bg ? luaL_checkinteger(L, 5) : 0;
+    int scale = luaL_optinteger(L, 6, 1);
+    
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+    
+    int cursor_x = x;
+    while (*str) {
+        fb_draw_char(cursor_x, y, *str, fg_color, has_bg, bg_color, scale);
+        cursor_x += 8 * scale;
+        str++;
+    }
+    return 0;
+}
+
+static int l_lcd_flush(lua_State *L)
+{
+    (void)L;
+    if (!lcd_framebuf) return 0;
+    
+    lcd_set_addr(0, 0, LCD_WIDTH, LCD_HEIGHT);
+    lcd_send_buffer((uint8_t*)lcd_framebuf, LCD_WIDTH * LCD_HEIGHT * 2);
+    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 1);
+    return 0;
+}
+
+static const luaL_Reg lcd_lib[] = {
+    {"setup",     l_lcd_setup},
+    {"clear",     l_lcd_clear},
+    {"fill",      l_lcd_fill},
+    {"pixel",     l_lcd_pixel},
+    {"print",     l_lcd_print},
+    {"flush",     l_lcd_flush},
+    {NULL, NULL}
+};
+
+static const luaL_Reg spi_lib[] = {
+    {"setup",    l_spi_setup},
+    {"transfer", l_spi_transfer},
+    {"write",    l_spi_write},
+    {"dc",       l_spi_dc},
+    {NULL, NULL}
+};
+
 static const luaL_Reg i2c_lib[] = {
     {"setup",      l_i2c_setup},
     {"write",      l_i2c_write},
@@ -508,6 +1159,8 @@ static void register_libs(lua_State *L)
     luaL_newlib(L, system_lib); lua_setglobal(L, "system");
     luaL_newlib(L, wifi_lib);   lua_setglobal(L, "wifi");
     luaL_newlib(L, i2c_lib);    lua_setglobal(L, "i2c");
+    luaL_newlib(L, spi_lib);    lua_setglobal(L, "spi");
+    luaL_newlib(L, lcd_lib);    lua_setglobal(L, "lcd");
 }
 
 /* ── Lua VM lifecycle ───────────────────────────────────────────── */
