@@ -138,7 +138,7 @@ esp_err_t mcp_handle_tools_call(cJSON *params, cJSON **result)
     ESP_LOGI(TAG, "Calling tool: %s", tool_name);
 
     // Execute tool
-    char result_text[8192]; // MCP_MAX_TOOL_RESULT_SIZE
+    char result_text[CONFIG_MCP_MAX_TOOL_RESULT_SIZE]; // MCP_MAX_TOOL_RESULT_SIZE
     bool is_error = false;
     esp_err_t ret = mcp_tools_execute(tool_name, arguments, result_text, sizeof(result_text), &is_error);
 

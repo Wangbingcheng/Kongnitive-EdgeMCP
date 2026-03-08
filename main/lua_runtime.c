@@ -472,7 +472,6 @@ static int l_i2c_scan(lua_State *L)
     lua_createtable(L, 0, 0);
     int found = 0;
     for (int addr = 1; addr < 127; addr++) {
-        uint8_t dummy = 0;
         i2c_device_config_t cfg = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = addr,
