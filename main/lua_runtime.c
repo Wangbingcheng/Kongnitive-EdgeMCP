@@ -709,7 +709,9 @@ static int lcd_dc_pin = -1;
 static int lcd_cs_pin = -1;
 static int lcd_res_pin = -1;
 static int lcd_bl_pin = -1;
-static uint16_t *lcd_framebuf = NULL;
+static uint16_t *lcd_framebuf[2] = {NULL, NULL};
+static int lcd_draw_idx = 0;
+static volatile bool lcd_dma_busy = false;
 static SemaphoreHandle_t lcd_flush_sem = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
@@ -746,6 +748,7 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_pane
     (void)panel_io;
     (void)edata;
     (void)user_ctx;
+    lcd_dma_busy = false;
     if (lcd_flush_sem) {
         xSemaphoreGive(lcd_flush_sem);
     }
@@ -859,8 +862,8 @@ static inline uint16_t swap_bytes(uint16_t val)
 
 static inline void fb_set_pixel(int x, int y, uint16_t color)
 {
-    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT && lcd_framebuf) {
-        lcd_framebuf[y * LCD_WIDTH + x] = swap_bytes(color);
+    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT && lcd_framebuf[lcd_draw_idx]) {
+        lcd_framebuf[lcd_draw_idx][y * LCD_WIDTH + x] = swap_bytes(color);
     }
 }
 
@@ -875,7 +878,7 @@ static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
     uint16_t swapped = swap_bytes(color);
     for (int py = y; py < y + h; py++) {
         for (int px = x; px < x + w; px++) {
-            lcd_framebuf[py * LCD_WIDTH + px] = swapped;
+            lcd_framebuf[lcd_draw_idx][py * LCD_WIDTH + px] = swapped;
         }
     }
     fb_mark_dirty(x, y, w, h);
@@ -1013,31 +1016,33 @@ static int l_lcd_setup(lua_State *L)
         ESP_LOGI(TAG, "ST7735: Backlight ON");
     }
 
-    if (lcd_framebuf == NULL) {
+    if (lcd_framebuf[0] == NULL) {
         lcd_flush_sem = xSemaphoreCreateBinary();
         if (lcd_flush_sem == NULL) {
             return luaL_error(L, "lcd.setup: semaphore create failed");
         }
-        lcd_framebuf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
-        if (lcd_framebuf == NULL) {
-            ESP_LOGE(TAG, "Failed to allocate frame buffer");
-            return luaL_error(L, "lcd.setup: frame buffer allocation failed");
+        for (int i = 0; i < 2; i++) {
+            lcd_framebuf[i] = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
+            if (lcd_framebuf[i] == NULL) {
+                ESP_LOGE(TAG, "Failed to allocate frame buffer %d", i);
+                return luaL_error(L, "lcd.setup: frame buffer allocation failed");
+            }
+            memset(lcd_framebuf[i], 0, LCD_WIDTH * LCD_HEIGHT * 2);
         }
-        memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
     }
 
-    ESP_LOGI(TAG, "ST7735 LCD initialized (frame buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2);
+    ESP_LOGI(TAG, "ST7735 LCD initialized (double buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2 * 2);
     return 0;
 }
 
 static int l_lcd_clear(lua_State *L)
 {
     int color = luaL_optinteger(L, 1, 0);
-    if (!lcd_framebuf) return 0;
+    if (!lcd_framebuf[lcd_draw_idx]) return 0;
     
     uint16_t swapped = swap_bytes(color);
     for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
-        lcd_framebuf[i] = swapped;
+        lcd_framebuf[lcd_draw_idx][i] = swapped;
     }
     fb_mark_dirty(0, 0, LCD_WIDTH, LCD_HEIGHT);
     return 0;
@@ -1091,17 +1096,27 @@ static int l_lcd_print(lua_State *L)
 static int l_lcd_flush(lua_State *L)
 {
     (void)L;
-    if (!lcd_framebuf || !lcd_panel_handle) return 0;
+    if (!lcd_framebuf[lcd_draw_idx] || !lcd_panel_handle) return 0;
 
     if (!fb_has_dirty()) {
         return 0;
     }
 
-    xSemaphoreTake(lcd_flush_sem, 0);
+    if (lcd_dma_busy) {
+        xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
+    }
 
-    esp_lcd_panel_draw_bitmap(lcd_panel_handle, dirty_x1, dirty_y1, dirty_x2, dirty_y2, lcd_framebuf);
+    int disp_idx = lcd_draw_idx;
+    lcd_draw_idx = 1 - lcd_draw_idx;
 
-    xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
+    for (int y = dirty_y1; y < dirty_y2; y++) {
+        for (int x = dirty_x1; x < dirty_x2; x++) {
+            lcd_framebuf[lcd_draw_idx][y * LCD_WIDTH + x] = lcd_framebuf[disp_idx][y * LCD_WIDTH + x];
+        }
+    }
+
+    lcd_dma_busy = true;
+    esp_lcd_panel_draw_bitmap(lcd_panel_handle, dirty_x1, dirty_y1, dirty_x2, dirty_y2, lcd_framebuf[disp_idx]);
 
     fb_clear_dirty();
     return 0;
