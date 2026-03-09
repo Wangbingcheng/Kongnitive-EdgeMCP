@@ -150,6 +150,7 @@ Lua 不是绝对必须，但它是当前默认架构选择，目的是提升迭�
 - `main/`：MCP server、协议、工具、运行时、OTA、Wi-Fi
 - `components/lua/`：Lua 5.4 组件
 - `doc/CONTRIBUTION.md`：贡献规范和 PR 检查项
+- `doc/lcd_optimization.zh-CN.md`：LCD 显示优化技术详解
 - `MCP_AGENT_CONFIG.md`：AI Agent 项目级行为说明
 - `doc/TODO.md`：技术待办
 
