@@ -55,7 +55,7 @@ while true do
             stage = 2
             stage_start = uptime
         else
-            time.sleep_ms(100)
+            time.sleep_ms(1000)
         end
 
     elseif stage == 2 then

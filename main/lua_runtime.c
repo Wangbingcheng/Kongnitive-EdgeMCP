@@ -27,6 +27,7 @@
 #include <esp_lcd_st7735.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -709,8 +710,47 @@ static int lcd_cs_pin = -1;
 static int lcd_res_pin = -1;
 static int lcd_bl_pin = -1;
 static uint16_t *lcd_framebuf = NULL;
+static SemaphoreHandle_t lcd_flush_sem = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
+
+static int dirty_x1 = LCD_WIDTH, dirty_y1 = LCD_HEIGHT, dirty_x2 = 0, dirty_y2 = 0;
+
+static void fb_mark_dirty(int x, int y, int w, int h)
+{
+    if (x < dirty_x1) dirty_x1 = x;
+    if (y < dirty_y1) dirty_y1 = y;
+    if (x + w > dirty_x2) dirty_x2 = x + w;
+    if (y + h > dirty_y2) dirty_y2 = y + h;
+    if (dirty_x1 < 0) dirty_x1 = 0;
+    if (dirty_y1 < 0) dirty_y1 = 0;
+    if (dirty_x2 > LCD_WIDTH) dirty_x2 = LCD_WIDTH;
+    if (dirty_y2 > LCD_HEIGHT) dirty_y2 = LCD_HEIGHT;
+}
+
+static void fb_clear_dirty(void)
+{
+    dirty_x1 = LCD_WIDTH;
+    dirty_y1 = LCD_HEIGHT;
+    dirty_x2 = 0;
+    dirty_y2 = 0;
+}
+
+static bool fb_has_dirty(void)
+{
+    return dirty_x2 > dirty_x1 && dirty_y2 > dirty_y1;
+}
+
+static bool on_color_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    (void)user_ctx;
+    if (lcd_flush_sem) {
+        xSemaphoreGive(lcd_flush_sem);
+    }
+    return false;
+}
 
 /* 8x8 font (95 characters: 0x20-0x7E) */
 static const uint8_t FONT_8X8[95][8] = {
@@ -838,12 +878,16 @@ static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
             lcd_framebuf[py * LCD_WIDTH + px] = swapped;
         }
     }
+    fb_mark_dirty(x, y, w, h);
 }
 
 static void fb_draw_char(int x, int y, char c, uint16_t fg, int has_bg, uint16_t bg, int scale)
 {
     int idx = c - ' ';
     if (idx < 0 || idx >= 95) return;
+    
+    int char_w = 8 * scale;
+    int char_h = 8 * scale;
     
     for (int row = 0; row < 8; row++) {
         uint8_t line = FONT_8X8[idx][row];
@@ -863,6 +907,7 @@ static void fb_draw_char(int x, int y, char c, uint16_t fg, int has_bg, uint16_t
             }
         }
     }
+    fb_mark_dirty(x, y, char_w, char_h);
 }
 
 static int l_lcd_setup(lua_State *L)
@@ -913,6 +958,8 @@ static int l_lcd_setup(lua_State *L)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .trans_queue_depth = 10,
+        .on_color_trans_done = on_color_trans_done,
+        .user_ctx = NULL,
     };
 
     ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &lcd_io_handle);
@@ -967,6 +1014,10 @@ static int l_lcd_setup(lua_State *L)
     }
 
     if (lcd_framebuf == NULL) {
+        lcd_flush_sem = xSemaphoreCreateBinary();
+        if (lcd_flush_sem == NULL) {
+            return luaL_error(L, "lcd.setup: semaphore create failed");
+        }
         lcd_framebuf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
         if (lcd_framebuf == NULL) {
             ESP_LOGE(TAG, "Failed to allocate frame buffer");
@@ -988,6 +1039,7 @@ static int l_lcd_clear(lua_State *L)
     for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
         lcd_framebuf[i] = swapped;
     }
+    fb_mark_dirty(0, 0, LCD_WIDTH, LCD_HEIGHT);
     return 0;
 }
 
@@ -1010,6 +1062,7 @@ static int l_lcd_pixel(lua_State *L)
     int color = luaL_checkinteger(L, 3);
     
     fb_set_pixel(x, y, color);
+    fb_mark_dirty(x, y, 1, 1);
     return 0;
 }
 
@@ -1040,7 +1093,17 @@ static int l_lcd_flush(lua_State *L)
     (void)L;
     if (!lcd_framebuf || !lcd_panel_handle) return 0;
 
-    esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_WIDTH, LCD_HEIGHT, lcd_framebuf);
+    if (!fb_has_dirty()) {
+        return 0;
+    }
+
+    xSemaphoreTake(lcd_flush_sem, 0);
+
+    esp_lcd_panel_draw_bitmap(lcd_panel_handle, dirty_x1, dirty_y1, dirty_x2, dirty_y2, lcd_framebuf);
+
+    xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
+
+    fb_clear_dirty();
     return 0;
 }
 
