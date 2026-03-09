@@ -150,6 +150,7 @@ How to verify:
 - `main/` - MCP server, protocol, tools, runtime, OTA, Wi-Fi
 - `components/lua/` - Lua 5.4 component
 - `doc/CONTRIBUTION.md` - contribution rules and PR checklist
+- `doc/lcd_optimization.md` - LCD display optimization technical details
 - `MCP_AGENT_CONFIG.md` - project-level agent behavior and MCP workflow
 - `doc/TODO.md` - open technical TODOs
 
