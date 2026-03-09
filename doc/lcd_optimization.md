@@ -4,10 +4,11 @@ This document explains the technical implementation of LCD display optimizations
 
 ## Overview
 
-The LCD driver (ST7735) implements two key optimizations to reduce CPU overhead and improve display performance:
+The LCD driver (ST7735) implements three key optimizations to reduce CPU overhead and improve display performance:
 
 1. **Dirty Rectangle Tracking** - Only refresh changed regions
 2. **DMA Async Transfer with Synchronization** - Non-blocking SPI transfer with completion callback
+3. **Double Buffering** - Parallel drawing and transfer, eliminating tearing
 
 ## Architecture
 
@@ -19,9 +20,12 @@ The LCD driver (ST7735) implements two key optimizations to reduce CPU overhead 
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   Frame Buffer (25.6KB)                      │
-│  160×80 pixels × 2 bytes/pixel = 25,600 bytes               │
-│  Allocated with MALLOC_CAP_DMA for DMA compatibility        │
+│                 Double Frame Buffer (51.2KB)                 │
+│  ┌─────────────────────┐  ┌─────────────────────┐          │
+│  │   Buffer[0] (25.6KB)│  │   Buffer[1] (25.6KB)│          │
+│  │   Draw/Display Buf  │  │   Display/Draw Buf  │          │
+│  └─────────────────────┘  └─────────────────────┘          │
+│         ↑ draw_idx=0           ↑ draw_idx=1                │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -36,7 +40,7 @@ The LCD driver (ST7735) implements two key optimizations to reduce CPU overhead 
 │              DMA Transfer + Semaphore Sync                   │
 │  esp_lcd_panel_draw_bitmap() → DMA transfer                 │
 │  on_color_trans_done() callback → xSemaphoreGive()          │
-│  lcd.flush() blocks until transfer complete                 │
+│  flush() returns immediately, draw/transfer parallel        │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -189,28 +193,116 @@ Lua: lcd.flush()
    Return to Lua
 ```
 
-### Why Block on Semaphore?
+## Optimization 3: Double Buffering
 
-The `lcd.flush()` function blocks until DMA completes because:
+### Problem
 
-1. **Data integrity**: Ensures the frame buffer isn't modified during transfer
-2. **Simple API**: Lua scripts don't need to manage async complexity
-3. **Tear-free**: Next frame starts only after current one is displayed
+With single buffering, Lua must wait for DMA transfer to complete before starting the next frame, causing CPU idle time.
+
+### Solution
+
+Use two frame buffers, allowing drawing and transfer to run in parallel on different buffers.
+
+### Implementation
+
+```c
+static uint16_t *lcd_framebuf[2] = {NULL, NULL};  // Double buffer
+static int lcd_draw_idx = 0;                       // Current draw buffer index
+static volatile bool lcd_dma_busy = false;         // DMA busy flag
+
+static int l_lcd_flush(lua_State *L)
+{
+    // 1. Wait for previous DMA to complete
+    if (lcd_dma_busy) {
+        xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
+    }
+
+    // 2. Current draw buffer becomes display buffer
+    int disp_idx = lcd_draw_idx;
+    
+    // 3. Switch to other buffer as new draw buffer
+    lcd_draw_idx = 1 - lcd_draw_idx;
+
+    // 4. Copy dirty rect data to new draw buffer (consistency)
+    for (int y = dirty_y1; y < dirty_y2; y++) {
+        for (int x = dirty_x1; x < dirty_x2; x++) {
+            lcd_framebuf[lcd_draw_idx][y * LCD_WIDTH + x] = 
+                lcd_framebuf[disp_idx][y * LCD_WIDTH + x];
+        }
+    }
+
+    // 5. Start DMA transfer (using old draw buffer)
+    lcd_dma_busy = true;
+    esp_lcd_panel_draw_bitmap(lcd_panel_handle, ... lcd_framebuf[disp_idx]);
+
+    // 6. Return immediately
+    fb_clear_dirty();
+    return 0;
+}
+```
+
+### Parallel Timeline
+
+```
+Time ──────────────────────────────────────────────────────────►
+
+Frame1: [Lua draw Buffer[0]] [flush] [Lua draw Buffer[1]] [flush] ...
+                               │            │              │
+                               ▼            ▼              ▼
+DMA:                      [Transfer Buffer[0]] [Transfer Buffer[1]] ...
+                               │            │
+                               └────────────┴── Lua and DMA parallel!
+```
+
+### Data Consistency
+
+Dirty rectangle data is copied from old buffer to new buffer:
+
+```
+Buffer[0] (disp_idx=0)          Buffer[1] (draw_idx=1)
+┌──────────────────┐           ┌──────────────────┐
+│  ┌────────────┐  │   copy    │  ┌────────────┐  │
+│  │ Dirty Rect │──┼──────────►│  │ Dirty Rect │  │
+│  └────────────┘  │           │  └────────────┘  │
+│                  │           │                  │
+└──────────────────┘           └──────────────────┘
+     DMA transfer ◄─────              Lua draw ◄─────
+```
+
+### Memory Cost
+
+| Item | Size |
+|------|------|
+| Single buffer | 25.6KB |
+| Double buffer | 51.2KB |
+
+Trading 51.2KB memory for parallel drawing and transfer.
 
 ## Memory Layout
 
 ```
 ┌────────────────────────────────────────┐
-│           Frame Buffer (25.6KB)         │
-│  ┌──────────────────────────────────┐  │
-│  │  Pixel (0,0)  │ Pixel (1,0) │ ...│  │  Row 0
-│  ├──────────────────────────────────┤  │
-│  │  Pixel (0,1)  │ Pixel (1,1) │ ...│  │  Row 1
-│  ├──────────────────────────────────┤  │
-│  │              ...                  │  │
-│  ├──────────────────────────────────┤  │
-│  │  Pixel (0,79) │ Pixel (1,79)│ ...│  │  Row 79
-│  └──────────────────────────────────┘  │
+│        Double Frame Buffer (51.2KB)     │
+│  ┌────────────────────────────────┐    │
+│  │      Buffer[0] (25.6KB)        │    │
+│  │  ┌──────────────────────────┐  │    │
+│  │  │Pixel(0,0)│Pixel(1,0)│...│  │    │  Row 0
+│  │  ├──────────────────────────┤  │    │
+│  │  │Pixel(0,1)│Pixel(1,1)│...│  │    │  Row 1
+│  │  │          ...             │  │    │
+│  │  │Pixel(0,79)│Pixel(1,79)│..│  │    │  Row 79
+│  │  └──────────────────────────┘  │    │
+│  └────────────────────────────────┘    │
+│  ┌────────────────────────────────┐    │
+│  │      Buffer[1] (25.6KB)        │    │
+│  │  ┌──────────────────────────┐  │    │
+│  │  │Pixel(0,0)│Pixel(1,0)│...│  │    │  Row 0
+│  │  ├──────────────────────────┤  │    │
+│  │  │Pixel(0,1)│Pixel(1,1)│...│  │    │  Row 1
+│  │  │          ...             │  │    │
+│  │  │Pixel(0,79)│Pixel(1,79)│..│  │    │  Row 79
+│  │  └──────────────────────────┘  │    │
+│  └────────────────────────────────┘    │
 └────────────────────────────────────────┘
 
 Where each pixel is 2 bytes (RGB565):
@@ -289,17 +381,15 @@ lcd.flush()
 
 ## Limitations
 
-1. **No true double buffering**: Current implementation uses single buffer with dirty tracking. For animations, consider adding a second buffer.
+1. **Dirty region merging**: Currently uses a single bounding box. Multiple small updates in corners will refresh the entire bounding box.
 
-2. **Blocking flush**: `lcd.flush()` blocks until DMA completes. For non-blocking operation, would need Lua callback support.
-
-3. **Dirty region merging**: Currently uses a single bounding box. Multiple small updates in corners will refresh the entire bounding box.
+2. **Dirty rect copy overhead**: Double buffering requires copying dirty rect data to new buffer during switch, which has some overhead for large updates.
 
 ## Future Improvements
 
 1. **Multiple dirty regions**: Track separate rectangles for better optimization
-2. **Non-blocking flush**: Return immediately, callback when done
-3. **Tearing effect**: Use TE pin for perfectly timed updates
+2. **Tearing effect elimination**: Use TE pin for perfectly timed updates
+3. **Async callback notification**: Notify Lua when DMA completes, instead of blocking wait
 4. **Partial Lua buffer**: Allow Lua to manage smaller buffers
 
 ## References
