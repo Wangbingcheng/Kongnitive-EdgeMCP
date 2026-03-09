@@ -20,6 +20,11 @@
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_lcd_io_spi.h>
+#include <esp_lcd_st7735.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -690,11 +695,22 @@ static int l_spi_dc(lua_State *L)
 #define LCD_WIDTH  160
 #define LCD_HEIGHT 80
 
+static const st7735_lcd_init_cmd_t st7735_init_cmds[] = {
+    {ST7735_SWRESET, NULL, 0, 150},
+    {ST7735_SLPOUT, NULL, 0, 500},
+    {ST7735_COLMOD, (uint8_t[]){0x05}, 1, 0},
+    {ST7735_MADCTL, (uint8_t[]){0x68}, 1, 0},
+    {ST7735_NORON, NULL, 0, 10},
+    {ST7735_DISPON, NULL, 0, 100},
+};
+
 static int lcd_dc_pin = -1;
 static int lcd_cs_pin = -1;
 static int lcd_res_pin = -1;
 static int lcd_bl_pin = -1;
 static uint16_t *lcd_framebuf = NULL;
+static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
+static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
 
 /* 8x8 font (95 characters: 0x20-0x7E) */
 static const uint8_t FONT_8X8[95][8] = {
@@ -849,66 +865,6 @@ static void fb_draw_char(int x, int y, char c, uint16_t fg, int has_bg, uint16_t
     }
 }
 
-static void lcd_send_cmd(uint8_t cmd)
-{
-    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 0);
-    gpio_set_level(lcd_dc_pin, 0);
-    spi_transaction_t t = {
-        .tx_buffer = &cmd,
-        .length = 8,
-    };
-    esp_err_t ret = spi_device_transmit(spi_handle, &t);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "lcd_send_cmd failed: %d", ret);
-    }
-}
-
-static void lcd_send_data(uint8_t data)
-{
-    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 0);
-    gpio_set_level(lcd_dc_pin, 1);
-    spi_transaction_t t = {
-        .tx_buffer = &data,
-        .length = 8,
-    };
-    esp_err_t ret = spi_device_transmit(spi_handle, &t);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "lcd_send_data failed: %d", ret);
-    }
-    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 1);
-}
-
-static void lcd_send_buffer(const uint8_t *data, int len)
-{
-    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 0);
-    gpio_set_level(lcd_dc_pin, 1);
-    spi_transaction_t t = {
-        .tx_buffer = data,
-        .length = len * 8,
-    };
-    spi_device_transmit(spi_handle, &t);
-    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 1);
-}
-
-static void lcd_set_addr(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
-{
-    uint8_t x_offset = 0;
-    uint8_t y_offset = 24;
-    uint8_t data[4];
-
-    lcd_send_cmd(0x2A);
-    data[0] = 0; data[1] = x + x_offset;
-    data[2] = 0; data[3] = x + w - 1 + x_offset;
-    for (int i = 0; i < 4; i++) lcd_send_data(data[i]);
-
-    lcd_send_cmd(0x2B);
-    data[0] = 0; data[1] = y + y_offset;
-    data[2] = 0; data[3] = y + h - 1 + y_offset;
-    for (int i = 0; i < 4; i++) lcd_send_data(data[i]);
-
-    lcd_send_cmd(0x2C);
-}
-
 static int l_lcd_setup(lua_State *L)
 {
     int mosi = luaL_checkinteger(L, 1);
@@ -918,59 +874,30 @@ static int l_lcd_setup(lua_State *L)
     int res = luaL_optinteger(L, 5, 6);
     int bl = luaL_optinteger(L, 6, 11);
     int freq = luaL_optinteger(L, 7, 20000000);
-    (void)freq;
 
     lcd_cs_pin = cs;
     lcd_dc_pin = dc;
     lcd_res_pin = res;
     lcd_bl_pin = bl;
 
-    ESP_LOGI(TAG, "ST7735: mosi=%d clk=%d cs=%d dc=%d res=%d bl=%d", mosi, clk, cs, dc, res, bl);
+    ESP_LOGI(TAG, "ST7735: mosi=%d clk=%d cs=%d dc=%d res=%d bl=%d freq=%d", mosi, clk, cs, dc, res, bl, freq);
 
-    if (spi_handle) {
-        spi_bus_remove_device(spi_handle);
-        spi_handle = NULL;
+    if (lcd_panel_handle) {
+        esp_lcd_panel_del(lcd_panel_handle);
+        lcd_panel_handle = NULL;
     }
-
-    if (dc >= 0) {
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << dc),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&io_conf);
-        gpio_set_level(dc, 0);
-    }
-    if (res >= 0) {
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << res),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&io_conf);
-    }
-    if (bl >= 0) {
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << bl),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&io_conf);
+    if (lcd_io_handle) {
+        esp_lcd_panel_io_del(lcd_io_handle);
+        lcd_io_handle = NULL;
     }
 
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = mosi,
-        .miso_io_num = -1,
+        .miso_io_num = GPIO_NUM_NC,
         .sclk_io_num = clk,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 32768,
+        .quadwp_io_num = GPIO_NUM_NC,
+        .quadhd_io_num = GPIO_NUM_NC,
+        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2,
     };
 
     esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
@@ -978,56 +905,53 @@ static int l_lcd_setup(lua_State *L)
         return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
     }
 
-    spi_device_interface_config_t dev_cfg = {
-        .command_bits = 0,
-        .address_bits = 0,
-        .dummy_bits = 0,
-        .mode = 0,
-        .duty_cycle_pos = 128,
-        .cs_ena_pretrans = 0,
-        .cs_ena_posttrans = 0,
-        .clock_speed_hz = 20000000,
-        .input_delay_ns = 0,
-        .spics_io_num = cs,
-        .flags = 0,
-        .queue_size = 1,
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .dc_gpio_num = dc,
+        .cs_gpio_num = cs,
+        .spi_mode = 0,
+        .pclk_hz = freq,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .trans_queue_depth = 10,
     };
 
-    ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle);
+    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &lcd_io_handle);
     if (ret != ESP_OK) {
-        return luaL_error(L, "lcd.setup add device failed: %s", esp_err_to_name(ret));
+        return luaL_error(L, "lcd.setup panel io failed: %s", esp_err_to_name(ret));
     }
 
-    gpio_set_level(res, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(res, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "ST7735: RESET done");
+    st7735_vendor_config_t vendor_config = {
+        .init_cmds = st7735_init_cmds,
+        .init_cmds_size = sizeof(st7735_init_cmds) / sizeof(st7735_lcd_init_cmd_t),
+    };
 
-    lcd_send_cmd(0x01);
-    vTaskDelay(pdMS_TO_TICKS(150));
-    ESP_LOGI(TAG, "ST7735: SWRESET done");
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = res,
+        .rgb_endian = LCD_RGB_ENDIAN_BGR,
+        .bits_per_pixel = 16,
+        .flags.reset_active_high = false,
+        .vendor_config = &vendor_config,
+    };
 
-    lcd_send_cmd(0x11);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    ESP_LOGI(TAG, "ST7735: SLPOUT done");
+    ret = esp_lcd_new_panel_st7735(lcd_io_handle, &panel_cfg, &lcd_panel_handle);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup panel failed: %s", esp_err_to_name(ret));
+    }
 
-    lcd_send_cmd(0x3A);
-    lcd_send_data(0x05);
-    ESP_LOGI(TAG, "ST7735: COLMOD done");
+    ret = esp_lcd_panel_reset(lcd_panel_handle);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup reset failed: %s", esp_err_to_name(ret));
+    }
 
-    lcd_send_cmd(0x36);
-    lcd_send_data(0x68);
-    ESP_LOGI(TAG, "ST7735: MADCTL done");
+    ret = esp_lcd_panel_init(lcd_panel_handle);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup init failed: %s", esp_err_to_name(ret));
+    }
 
-    lcd_send_cmd(0x13);
-    ESP_LOGI(TAG, "ST7735: NORON done");
-
-    lcd_send_cmd(0x29);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "ST7735: DISPON done");
-
-    vTaskDelay(pdMS_TO_TICKS(100));
+    ret = esp_lcd_panel_set_gap(lcd_panel_handle, 0, 24);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup set gap failed: %s", esp_err_to_name(ret));
+    }
 
     if (lcd_bl_pin >= 0) {
         gpio_config_t io_conf = {
@@ -1050,7 +974,7 @@ static int l_lcd_setup(lua_State *L)
         }
         memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
     }
-    
+
     ESP_LOGI(TAG, "ST7735 LCD initialized (frame buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2);
     return 0;
 }
@@ -1114,11 +1038,9 @@ static int l_lcd_print(lua_State *L)
 static int l_lcd_flush(lua_State *L)
 {
     (void)L;
-    if (!lcd_framebuf) return 0;
-    
-    lcd_set_addr(0, 0, LCD_WIDTH, LCD_HEIGHT);
-    lcd_send_buffer((uint8_t*)lcd_framebuf, LCD_WIDTH * LCD_HEIGHT * 2);
-    if (lcd_cs_pin >= 0) gpio_set_level(lcd_cs_pin, 1);
+    if (!lcd_framebuf || !lcd_panel_handle) return 0;
+
+    esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_WIDTH, LCD_HEIGHT, lcd_framebuf);
     return 0;
 }
 

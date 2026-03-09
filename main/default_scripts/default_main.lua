@@ -35,18 +35,21 @@ local base_heap = system.heap_free() or 0
 
 local stage = 1
 local stage_start = system.uptime() or 0
+local stage1_done = false
+local stage2_done = false
 
 local last_frame = system.uptime()
 local frame_interval = 0.03   -- 30ms = 33 FPS
-
+local color_index = 0
 while true do
     local uptime = system.uptime()
     local elapsed = uptime - stage_start
 
     if stage == 1 then
         if not stage1_done then
-            display:test_pattern()
-            stage1_done = true
+            display:test_pattern(color_index)
+            color_index = color_index + 1
+            
         end
         if elapsed >= 5 then
             stage = 2
@@ -58,7 +61,7 @@ while true do
     elseif stage == 2 then
         if not stage2_done then
             display:show_welcome()
-            stage2_done = true
+
         end
         if elapsed >= 2 then
             stage = 3
