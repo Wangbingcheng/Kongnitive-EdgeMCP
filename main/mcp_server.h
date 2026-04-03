@@ -45,6 +45,16 @@ esp_err_t mcp_http_handler(httpd_req_t *req);
  */
 esp_err_t mcp_info_handler(httpd_req_t *req);
 
+/**
+ * PATCH handler - returns 405 Method Not Allowed with Allow header
+ */
+esp_err_t mcp_patch_handler(httpd_req_t *req);
+
+/**
+ * OPTIONS handler - returns 204 with CORS headers for preflight
+ */
+esp_err_t mcp_options_handler(httpd_req_t *req);
+
 #ifdef __cplusplus
 }
 #endif

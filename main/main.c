@@ -79,6 +79,22 @@ static const httpd_uri_t mcp_info = {
     .user_ctx   = NULL,
 };
 
+/* MCP PATCH endpoint - returns 405 with Allow header */
+static const httpd_uri_t mcp_patch = {
+    .uri        = "/mcp",
+    .method     = HTTP_PATCH,
+    .handler    = mcp_patch_handler,
+    .user_ctx   = NULL,
+};
+
+/* MCP OPTIONS endpoint - returns 204 with CORS headers */
+static const httpd_uri_t mcp_options = {
+    .uri        = "/mcp",
+    .method     = HTTP_OPTIONS,
+    .handler    = mcp_options_handler,
+    .user_ctx   = NULL,
+};
+
 static void send_ping(void *arg)
 {
     struct async_resp_arg *resp_arg = arg;
@@ -117,7 +133,7 @@ static httpd_handle_t start_http_server(void)
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
     config.lru_purge_enable = true;
-    config.stack_size = 16384;                   /* larger stack for WiFi API calls and tool results */
+    config.stack_size = 12288;                   /* reduced from 16384 to free heap */
 
     esp_err_t ret = httpd_start(&server, &config);
     if (ret != ESP_OK) {
@@ -127,6 +143,8 @@ static httpd_handle_t start_http_server(void)
 
     httpd_register_uri_handler(server, &mcp_http);
     httpd_register_uri_handler(server, &mcp_info);
+    httpd_register_uri_handler(server, &mcp_patch);
+    httpd_register_uri_handler(server, &mcp_options);
     ESP_LOGI(TAG, "HTTP server started, MCP at http://<ip>/mcp (POST)");
     return server;
 }
@@ -146,7 +164,7 @@ static httpd_handle_t start_mcp_server(void)
 
     httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
     conf.httpd.max_open_sockets = max_clients;
-    conf.httpd.stack_size = 16384;
+    conf.httpd.stack_size = 12288;
     conf.httpd.global_user_ctx = keep_alive;
     conf.httpd.open_fn = wss_open_fd;
     conf.httpd.close_fn = wss_close_fd;
@@ -171,6 +189,8 @@ static httpd_handle_t start_mcp_server(void)
     ESP_LOGI(TAG, "Registering MCP endpoints at /mcp (WSS + HTTP POST)");
     httpd_register_uri_handler(server, &mcp_ws);
     httpd_register_uri_handler(server, &mcp_http);
+    httpd_register_uri_handler(server, &mcp_patch);
+    httpd_register_uri_handler(server, &mcp_options);
     wss_keep_alive_set_user_ctx(keep_alive, server);
 
     /* Initialize MCP server */

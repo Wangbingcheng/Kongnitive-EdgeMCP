@@ -246,3 +246,26 @@ esp_err_t mcp_info_handler(httpd_req_t *req)
     httpd_resp_send(req, info, strlen(info));
     return ESP_OK;
 }
+
+/* --- PATCH /mcp (method not allowed) --- */
+
+esp_err_t mcp_patch_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_hdr(req, "Allow", "GET, POST");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* --- OPTIONS /mcp (CORS preflight) --- */
+
+esp_err_t mcp_options_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Allow", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Max-Age", "86400");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}

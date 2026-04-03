@@ -25,6 +25,14 @@ extern "C" {
 esp_err_t mcp_log_init(void);
 
 /**
+ * Deinitialize the log capture system.
+ * Removes the vprintf hook and deletes the mutex.
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t mcp_log_deinit(void);
+
+/**
  * Tool handler: sys_get_logs
  * Returns filtered log lines from the ring buffer.
  *

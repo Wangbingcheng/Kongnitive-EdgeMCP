@@ -103,6 +103,20 @@ esp_err_t mcp_log_init(void)
     return ESP_OK;
 }
 
+esp_err_t mcp_log_deinit(void)
+{
+    if (s_log_mutex) {
+        vSemaphoreDelete(s_log_mutex);
+        s_log_mutex = NULL;
+    }
+    if (s_original_vprintf) {
+        esp_log_set_vprintf(s_original_vprintf);
+        s_original_vprintf = NULL;
+    }
+    ESP_LOGI(TAG, "Log capture deinitialized");
+    return ESP_OK;
+}
+
 static esp_log_level_t parse_level_string(const char *level_str)
 {
     if (!level_str) return ESP_LOG_INFO;

@@ -19,6 +19,7 @@ static const char *TAG = "mcp_ota";
 static ota_state_t s_ota_state = OTA_STATE_IDLE;
 static int s_ota_progress_pct = 0;
 static char s_ota_message[128] = "idle";
+static esp_timer_handle_t s_ota_confirm_timer = NULL;
 
 #define OTA_BUF_SIZE 1024
 #define OTA_AUTO_CONFIRM_SEC 60
@@ -26,6 +27,7 @@ static char s_ota_message[128] = "idle";
 /* --- Auto-confirm timer callback --- */
 static void ota_auto_confirm_timer_cb(void *arg)
 {
+    (void)arg;
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
@@ -33,6 +35,10 @@ static void ota_auto_confirm_timer_cb(void *arg)
             ESP_LOGI(TAG, "Auto-confirming OTA image after %d seconds", OTA_AUTO_CONFIRM_SEC);
             esp_ota_mark_app_valid_cancel_rollback();
         }
+    }
+    if (s_ota_confirm_timer) {
+        esp_timer_delete(s_ota_confirm_timer);
+        s_ota_confirm_timer = NULL;
     }
 }
 
@@ -182,9 +188,8 @@ esp_err_t mcp_ota_init(void)
                 .callback = ota_auto_confirm_timer_cb,
                 .name = "ota_confirm",
             };
-            esp_timer_handle_t timer;
-            esp_timer_create(&timer_args, &timer);
-            esp_timer_start_once(timer, (uint64_t)OTA_AUTO_CONFIRM_SEC * 1000000ULL);
+            esp_timer_create(&timer_args, &s_ota_confirm_timer);
+            esp_timer_start_once(s_ota_confirm_timer, (uint64_t)OTA_AUTO_CONFIRM_SEC * 1000000ULL);
         } else {
             ESP_LOGI(TAG, "OTA image already confirmed");
         }
@@ -215,7 +220,7 @@ esp_err_t tool_sys_ota_push(cJSON *args, char *result, size_t max_len)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ret = xTaskCreate(ota_task, "ota_task", 8192, url, 5, NULL);
+    BaseType_t ret = xTaskCreate(ota_task, "ota_task", 6144, url, 5, NULL);
     if (ret != pdPASS) {
         free(url);
         snprintf(result, max_len, "Failed to create OTA task");

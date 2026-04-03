@@ -36,7 +36,7 @@
 static const char *TAG = "lua_rt";
 
 #define SPIFFS_BASE_PATH "/spiffs"
-#define LUA_TASK_STACK   8192
+#define LUA_TASK_STACK   6144
 #define LUA_TASK_PRIO    5
 
 static lua_State *L = NULL;
@@ -136,7 +136,7 @@ static esp_err_t spiffs_init(void)
     esp_vfs_spiffs_conf_t conf = {
         .base_path = SPIFFS_BASE_PATH,
         .partition_label = "storage",
-        .max_files = 6,
+        .max_files = 20,
         .format_if_mount_failed = true,
     };
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
@@ -709,8 +709,7 @@ static int lcd_dc_pin = -1;
 static int lcd_cs_pin = -1;
 static int lcd_res_pin = -1;
 static int lcd_bl_pin = -1;
-static uint16_t *lcd_framebuf[2] = {NULL, NULL};
-static int lcd_draw_idx = 0;
+static uint16_t *lcd_framebuf = NULL;
 static volatile bool lcd_dma_busy = false;
 static SemaphoreHandle_t lcd_flush_sem = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
@@ -736,6 +735,18 @@ static void fb_clear_dirty(void)
     dirty_y1 = LCD_HEIGHT;
     dirty_x2 = 0;
     dirty_y2 = 0;
+}
+
+static void lcd_free_buffers(void)
+{
+    if (lcd_framebuf) {
+        heap_caps_free(lcd_framebuf);
+        lcd_framebuf = NULL;
+    }
+    if (lcd_flush_sem) {
+        vSemaphoreDelete(lcd_flush_sem);
+        lcd_flush_sem = NULL;
+    }
 }
 
 static bool fb_has_dirty(void)
@@ -862,8 +873,8 @@ static inline uint16_t swap_bytes(uint16_t val)
 
 static inline void fb_set_pixel(int x, int y, uint16_t color)
 {
-    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT && lcd_framebuf[lcd_draw_idx]) {
-        lcd_framebuf[lcd_draw_idx][y * LCD_WIDTH + x] = swap_bytes(color);
+    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT && lcd_framebuf) {
+        lcd_framebuf[y * LCD_WIDTH + x] = swap_bytes(color);
     }
 }
 
@@ -878,7 +889,7 @@ static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
     uint16_t swapped = swap_bytes(color);
     for (int py = y; py < y + h; py++) {
         for (int px = x; px < x + w; px++) {
-            lcd_framebuf[lcd_draw_idx][py * LCD_WIDTH + px] = swapped;
+            lcd_framebuf[py * LCD_WIDTH + px] = swapped;
         }
     }
     fb_mark_dirty(x, y, w, h);
@@ -1016,33 +1027,31 @@ static int l_lcd_setup(lua_State *L)
         ESP_LOGI(TAG, "ST7735: Backlight ON");
     }
 
-    if (lcd_framebuf[0] == NULL) {
+    if (lcd_framebuf == NULL) {
         lcd_flush_sem = xSemaphoreCreateBinary();
         if (lcd_flush_sem == NULL) {
             return luaL_error(L, "lcd.setup: semaphore create failed");
         }
-        for (int i = 0; i < 2; i++) {
-            lcd_framebuf[i] = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
-            if (lcd_framebuf[i] == NULL) {
-                ESP_LOGE(TAG, "Failed to allocate frame buffer %d", i);
-                return luaL_error(L, "lcd.setup: frame buffer allocation failed");
-            }
-            memset(lcd_framebuf[i], 0, LCD_WIDTH * LCD_HEIGHT * 2);
+        lcd_framebuf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
+        if (lcd_framebuf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate frame buffer");
+            return luaL_error(L, "lcd.setup: frame buffer allocation failed");
         }
+        memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
     }
 
-    ESP_LOGI(TAG, "ST7735 LCD initialized (double buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2 * 2);
+    ESP_LOGI(TAG, "ST7735 LCD initialized (single buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2);
     return 0;
 }
 
 static int l_lcd_clear(lua_State *L)
 {
     int color = luaL_optinteger(L, 1, 0);
-    if (!lcd_framebuf[lcd_draw_idx]) return 0;
+    if (!lcd_framebuf) return 0;
     
     uint16_t swapped = swap_bytes(color);
     for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
-        lcd_framebuf[lcd_draw_idx][i] = swapped;
+        lcd_framebuf[i] = swapped;
     }
     fb_mark_dirty(0, 0, LCD_WIDTH, LCD_HEIGHT);
     return 0;
@@ -1075,7 +1084,17 @@ static int l_lcd_print(lua_State *L)
 {
     int x = luaL_checkinteger(L, 1);
     int y = luaL_checkinteger(L, 2);
-    const char *str = luaL_checkstring(L, 3);
+    
+    size_t len = 0;
+    const char *lua_str = luaL_checklstring(L, 3, &len);
+    
+    char local_buf[64];
+    if (len >= sizeof(local_buf)) {
+        len = sizeof(local_buf) - 1;
+    }
+    memcpy(local_buf, lua_str, len);
+    local_buf[len] = '\0';
+    
     int fg_color = luaL_optinteger(L, 4, 0xFFFF);
     int has_bg = !lua_isnoneornil(L, 5);
     int bg_color = has_bg ? luaL_checkinteger(L, 5) : 0;
@@ -1085,6 +1104,7 @@ static int l_lcd_print(lua_State *L)
     if (scale > 4) scale = 4;
     
     int cursor_x = x;
+    char *str = local_buf;
     while (*str) {
         fb_draw_char(cursor_x, y, *str, fg_color, has_bg, bg_color, scale);
         cursor_x += 8 * scale;
@@ -1093,10 +1113,51 @@ static int l_lcd_print(lua_State *L)
     return 0;
 }
 
+static int l_lcd_draw_pixels(lua_State *L)
+{
+    int x = luaL_checkinteger(L, 1);
+    int y = luaL_checkinteger(L, 2);
+    int w = luaL_checkinteger(L, 3);
+    int h = luaL_checkinteger(L, 4);
+    size_t data_len;
+    const char *data = luaL_checklstring(L, 5, &data_len);
+    
+    int expected = w * h * 2;
+    if (data_len < expected) {
+        return luaL_error(L, "pixel data too short: need %d bytes, got %d", expected, (int)data_len);
+    }
+    
+    if (!lcd_framebuf) {
+        return luaL_error(L, "LCD not initialized");
+    }
+    
+    int clipped_x = x;
+    int clipped_y = y;
+    int clipped_w = w;
+    int clipped_h = h;
+    
+    if (clipped_x < 0) { clipped_w += clipped_x; clipped_x = 0; }
+    if (clipped_y < 0) { clipped_h += clipped_y; clipped_y = 0; }
+    if (clipped_x + clipped_w > LCD_WIDTH) clipped_w = LCD_WIDTH - clipped_x;
+    if (clipped_y + clipped_h > LCD_HEIGHT) clipped_h = LCD_HEIGHT - clipped_y;
+    if (clipped_w <= 0 || clipped_h <= 0) return 0;
+    
+    int src_start = (clipped_y - y) * w * 2 + (clipped_x - x) * 2;
+    
+    for (int row = 0; row < clipped_h; row++) {
+        int dst_idx = (clipped_y + row) * LCD_WIDTH + clipped_x;
+        int src_idx = src_start + row * w * 2;
+        memcpy(&lcd_framebuf[dst_idx], data + src_idx, clipped_w * 2);
+    }
+    
+    fb_mark_dirty(clipped_x, clipped_y, clipped_x + clipped_w, clipped_y + clipped_h);
+    return 0;
+}
+
 static int l_lcd_flush(lua_State *L)
 {
     (void)L;
-    if (!lcd_framebuf[lcd_draw_idx] || !lcd_panel_handle) return 0;
+    if (!lcd_framebuf || !lcd_panel_handle) return 0;
 
     if (!fb_has_dirty()) {
         return 0;
@@ -1106,29 +1167,21 @@ static int l_lcd_flush(lua_State *L)
         xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
     }
 
-    int disp_idx = lcd_draw_idx;
-    lcd_draw_idx = 1 - lcd_draw_idx;
-
-    for (int y = dirty_y1; y < dirty_y2; y++) {
-        for (int x = dirty_x1; x < dirty_x2; x++) {
-            lcd_framebuf[lcd_draw_idx][y * LCD_WIDTH + x] = lcd_framebuf[disp_idx][y * LCD_WIDTH + x];
-        }
-    }
-
     lcd_dma_busy = true;
-    esp_lcd_panel_draw_bitmap(lcd_panel_handle, dirty_x1, dirty_y1, dirty_x2, dirty_y2, lcd_framebuf[disp_idx]);
+    esp_lcd_panel_draw_bitmap(lcd_panel_handle, dirty_x1, dirty_y1, dirty_x2, dirty_y2, lcd_framebuf);
 
     fb_clear_dirty();
     return 0;
 }
 
 static const luaL_Reg lcd_lib[] = {
-    {"setup",     l_lcd_setup},
-    {"clear",     l_lcd_clear},
-    {"fill",      l_lcd_fill},
-    {"pixel",     l_lcd_pixel},
-    {"print",     l_lcd_print},
-    {"flush",     l_lcd_flush},
+    {"setup",       l_lcd_setup},
+    {"clear",       l_lcd_clear},
+    {"fill",        l_lcd_fill},
+    {"pixel",       l_lcd_pixel},
+    {"print",       l_lcd_print},
+    {"draw_pixels", l_lcd_draw_pixels},
+    {"flush",       l_lcd_flush},
     {NULL, NULL}
 };
 
@@ -1253,6 +1306,9 @@ esp_err_t lua_runtime_restart(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
+    /* Free LCD buffers before destroying VM */
+    lcd_free_buffers();
+
     /* Destroy and recreate VM (task is dead, safe to access directly) */
     destroy_vm(L);
     L = create_vm();
@@ -1344,6 +1400,12 @@ esp_err_t lua_runtime_push_script(const char *name, const char *content, bool ap
     fclose(f);
     ESP_LOGI(TAG, "Script %s: %s (%d bytes)", append ? "appended" : "written",
              name, (int)strlen(content));
+
+    /* Force GC to free any accumulated memory from previous scripts */
+    if (L) {
+        lua_gc(L, LUA_GCCOLLECT, 0);
+    }
+
     return ESP_OK;
 }
 
