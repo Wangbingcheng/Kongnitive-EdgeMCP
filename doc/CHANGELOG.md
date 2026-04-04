@@ -21,12 +21,17 @@
 - `lcd.fill()` now writes to frame buffer
 - `lcd.pixel()` now writes to frame buffer
 - All Lua display functions now require `lcd.flush()` call after drawing
+- Debug log level: reduced verbose logging in `jsonrpc.c` and `mcp_server.c` from `ESP_LOGI` to `ESP_LOGD`
+- JSON-RPC parsing: use `cJSON_DetachItemFromObject` instead of `cJSON_Duplicate` to avoid memory pressure
 
 ### Fixed
 
 - Screen flicker issue caused by clearing screen before drawing text
 - Byte order issue (ESP32 little-endian vs ST7735 MSB-first SPI)
 - Watchdog timeout caused by busy loop without yielding CPU
+- **CRITICAL**: Memory leak in `mcp_handle_tools_call` — `cJSON_CreateObject()` for missing `arguments` was never freed (`mcp_protocol.c:132`)
+- **MEDIUM**: Memory leak in `check_client_alive_cb` — `async_resp_arg` leaked when `httpd_queue_work()` fails (`main.c:118`)
+- **LOW**: I2C scan leak — devices added during scan were never removed (`lua_runtime.c:527`)
 
 ### Removed
 

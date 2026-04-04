@@ -45,9 +45,13 @@ static esp_err_t mcp_dispatch_method(const char *method, cJSON *params, cJSON **
         return ESP_ERR_INVALID_ARG;
     }
     
+    ESP_LOGD(TAG, "Dispatching method: '%s'", method);
+    
     // Find method handler
     for (const mcp_method_entry_t *entry = method_table; entry->method != NULL; entry++) {
+        ESP_LOGD(TAG, "Checking method table: '%s' vs '%s'", method, entry->method);
         if (strcmp(entry->method, method) == 0) {
+            ESP_LOGD(TAG, "Found handler for: '%s'", method);
             return entry->handler(params, result);
         }
     }
@@ -76,12 +80,16 @@ char* mcp_server_process_message(const char *json_str)
     
     // Handle request
     if (msg.type == JSONRPC_REQUEST) {
+        ESP_LOGD(TAG, ">>> Processing request: method=%s, id=%d", msg.method, msg.id);
         cJSON *result = NULL;
         err = mcp_dispatch_method(msg.method, msg.params, &result);
         
+        ESP_LOGD(TAG, ">>> Method result: err=%d, result=%p", err, result);
+        
         if (err == ESP_OK && result) {
             response = jsonrpc_create_response(msg.id, result);
-            cJSON_Delete(result);
+            ESP_LOGD(TAG, ">>> jsonrpc_create_response returned: %p", response);
+            // Note: jsonrpc_create_response takes ownership of result, don't delete here
         } else if (err == ESP_ERR_NOT_FOUND) {
             response = jsonrpc_create_error(msg.id, JSONRPC_METHOD_NOT_FOUND, 
                                            "Method not found");
@@ -89,12 +97,13 @@ char* mcp_server_process_message(const char *json_str)
             response = jsonrpc_create_error(msg.id, JSONRPC_INVALID_PARAMS, 
                                            "Invalid parameters");
         } else {
+            ESP_LOGW(TAG, "Method failed: err=%d, result=%p", err, result);
             response = jsonrpc_create_error(msg.id, JSONRPC_INTERNAL_ERROR, 
                                            "Internal error");
         }
     } else if (msg.type == JSONRPC_NOTIFICATION) {
         // Notifications don't get responses
-        ESP_LOGI(TAG, "Received notification: %s", msg.method);
+        ESP_LOGD(TAG, "Received notification: %s", msg.method);
     } else {
         response = jsonrpc_create_error(0, JSONRPC_INVALID_REQUEST, 
                                        "Invalid message type");
@@ -109,7 +118,7 @@ char* mcp_server_process_message(const char *json_str)
 esp_err_t mcp_ws_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "MCP client connected");
+        ESP_LOGD(TAG, "MCP client connected");
         return ESP_OK;
     }
     
@@ -144,7 +153,7 @@ esp_err_t mcp_ws_handler(httpd_req_t *req)
         
         // Process message based on type
         if (ws_pkt.type == HTTPD_WS_TYPE_TEXT) {
-            ESP_LOGI(TAG, "Received MCP message");
+            ESP_LOGD(TAG, "Received MCP message");
             
             // Process MCP message
             char *response = mcp_server_process_message((char*)ws_pkt.payload);
@@ -169,7 +178,7 @@ esp_err_t mcp_ws_handler(httpd_req_t *req)
             ws_pkt.type = HTTPD_WS_TYPE_PONG;
             ret = httpd_ws_send_frame(req, &ws_pkt);
         } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
-            ESP_LOGI(TAG, "Received CLOSE frame");
+            ESP_LOGD(TAG, "Received CLOSE frame");
             ws_pkt.len = 0;
             ws_pkt.payload = NULL;
             ret = httpd_ws_send_frame(req, &ws_pkt);
@@ -212,7 +221,7 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
     }
     body[content_len] = '\0';
 
-    ESP_LOGI(TAG, "HTTP MCP request (%d bytes)", content_len);
+    ESP_LOGD(TAG, "HTTP MCP request (%d bytes)", content_len);
 
     /* Process through the same MCP pipeline as WebSocket */
     char *response = mcp_server_process_message(body);
@@ -224,9 +233,10 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
         httpd_resp_send(req, response, strlen(response));
         free(response);
     } else {
-        /* Notification -> 202 Accepted, no body */
-        httpd_resp_set_status(req, "202 Accepted");
-        httpd_resp_send(req, NULL, 0);
+        /* This should not happen for requests - return error */
+        const char *err = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, err, strlen(err));
     }
 
     return ESP_OK;

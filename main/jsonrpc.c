@@ -62,15 +62,13 @@ esp_err_t jsonrpc_parse_message(const char *json_str, jsonrpc_message_t *msg)
         strncpy(msg->method, method->valuestring, sizeof(msg->method) - 1);
         msg->method[sizeof(msg->method) - 1] = '\0';
 
-        // Extract parameters (detach from root so we can delete root)
-        cJSON *params = cJSON_GetObjectItem(root, "params");
-        if (params) {
-            msg->params = cJSON_Duplicate(params, true);
-        }
+        // Transfer ownership instead of duplicating to avoid memory pressure
+        cJSON *params = cJSON_DetachItemFromObject(root, "params");
+        msg->params = params;
     } else if (result) {
         // This is a success response
         msg->type = JSONRPC_RESPONSE;
-        msg->result = cJSON_Duplicate(result, true);
+        msg->result = cJSON_DetachItemFromObject(root, "result");
     } else if (error) {
         // This is an error response
         msg->type = JSONRPC_ERROR;
@@ -96,23 +94,51 @@ esp_err_t jsonrpc_parse_message(const char *json_str, jsonrpc_message_t *msg)
 
 char* jsonrpc_create_response(int id, cJSON *result)
 {
+    ESP_LOGD(TAG, ">>> jsonrpc_create_response called: id=%d, result=%p", id, result);
+    
     if (!result) {
+        ESP_LOGE(TAG, "jsonrpc_create_response called with NULL result!");
         return NULL;
     }
 
+    // Print result first for debug
+    char *result_str = cJSON_Print(result);
+    ESP_LOGD(TAG, ">>> result JSON: %s", result_str ? result_str : "(null)");
+    if (result_str) free(result_str);
+
+    // Create response and manually build it
     cJSON *response = cJSON_CreateObject();
     if (!response) {
         ESP_LOGE(TAG, "Failed to create response object");
         return NULL;
     }
 
-    cJSON_AddStringToObject(response, "jsonrpc", "2.0");
-    cJSON_AddNumberToObject(response, "id", id);
-    cJSON_AddItemToObject(response, "result", cJSON_Duplicate(result, true));
+    cJSON_AddItemToObject(response, "jsonrpc", cJSON_CreateString("2.0"));
+    cJSON_AddItemToObject(response, "id", cJSON_CreateNumber(id));
+    
+    // For result, we need to handle it carefully
+    // If it's an object/array, we can add it directly; otherwise wrap it
+    if (result->type & cJSON_Object) {
+        // result is already an object, move its children to response
+        cJSON_AddItemToObject(response, "result", result);
+    } else if (result->type & cJSON_Array) {
+        cJSON_AddItemToObject(response, "result", result);
+    } else {
+        // Primitive type, wrap in a generic object
+        cJSON *result_obj = cJSON_CreateObject();
+        cJSON_AddItemToObject(result_obj, "value", result);
+        cJSON_AddItemToObject(response, "result", result_obj);
+    }
 
     char *json_str = cJSON_PrintUnformatted(response);
+    
+    if (json_str) {
+        ESP_LOGD(TAG, ">>> Response JSON: %s", json_str);
+    } else {
+        ESP_LOGE(TAG, ">>> cJSON_PrintUnformatted FAILED!");
+    }
+    
     cJSON_Delete(response);
-
     return json_str;
 }
 

@@ -15,11 +15,8 @@ end
 
 local display
 for iface, instance in pairs(instances) do
-    log.info("Checking instance:", iface, instance)
     if type(instance.show_status) == "function" then
         display = instance
-        log.info("Found display, calling init...")
-        display:init()
         break
     end
 end
@@ -29,9 +26,9 @@ if not display then
     return
 end
 
-log.info("Starting display sequence...")
-
 local base_heap = system.heap_free() or 0
+local last_gc = 0
+local last_trim = 0
 
 local stage = 1
 local stage_start = system.uptime() or 0
@@ -39,21 +36,22 @@ local stage1_done = false
 local stage2_done = false
 
 local last_frame = system.uptime()
-local frame_interval = 0.03   -- 30ms = 33 FPS
-local color_index = 0
+local frame_interval = 0.03
+local last_status = 0
+local status_interval = 2.0
+
 while true do
-    local uptime = system.uptime()
-    local elapsed = uptime - stage_start
+    local now = system.uptime()
+    local elapsed = now - stage_start
 
     if stage == 1 then
         if not stage1_done then
-            display:test_pattern(color_index)
-            color_index = color_index + 1
-            
+            display:test_pattern(0)
+            stage1_done = true
         end
         if elapsed >= 5 then
             stage = 2
-            stage_start = uptime
+            stage_start = now
         else
             time.sleep_ms(1000)
         end
@@ -61,31 +59,42 @@ while true do
     elseif stage == 2 then
         if not stage2_done then
             display:show_welcome()
-
+            stage2_done = true
         end
         if elapsed >= 2 then
             stage = 3
-            stage_start = uptime
+            stage_start = now
         else
             time.sleep_ms(100)
         end
 
     elseif stage == 3 then
-        local now = system.uptime()
         if now - last_frame >= frame_interval then
             last_frame = now
 
-            local heap_free = system.heap_free() or 0
-            local runtime_used = base_heap - heap_free
-            if runtime_used < 0 then runtime_used = 0 end
-            local lua_kb = collectgarbage("count")
+            if now - last_status >= status_interval then
+                last_status = now
+                local heap_free = system.heap_free() or 0
+                local runtime_used = base_heap - heap_free
+                if runtime_used < 0 then runtime_used = 0 end
 
-            display:show_status(
-                heap_free / 1024,
-                runtime_used / 1024,
-                lua_kb,
-                math.floor(now + 0.5)
-            )
+                display:show_status(
+                    heap_free / 1024,
+                    runtime_used / 1024,
+                    collectgarbage("count"),
+                    math.floor(now + 0.5)
+                )
+            end
+
+            if now - last_gc >= 10 then
+                last_gc = now
+                collectgarbage("collect")
+            end
+
+            if now - last_trim >= 30 then
+                last_trim = now
+                system.trim_heap()
+            end
         else
             time.sleep_ms(10)
         end

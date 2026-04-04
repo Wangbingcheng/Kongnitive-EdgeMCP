@@ -7,7 +7,7 @@
 #include "lua_runtime.h"
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <malloc.h>
 #include <stdint.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -128,6 +128,7 @@ extern const uint8_t default_provider_st7735_lua_start[] asm("_binary_default_pr
 extern const uint8_t default_provider_sht40_lua_start[] asm("_binary_default_provider_sht40_lua_start");
 extern const uint8_t default_bindings_lua_start[] asm("_binary_default_bindings_lua_start");
 extern const uint8_t default_main_lua_start[] asm("_binary_default_main_lua_start");
+extern const uint8_t default_main_lua_end[] asm("_binary_default_main_lua_end");
 
 /* ── SPIFFS helpers ─────────────────────────────────────────────── */
 
@@ -312,6 +313,35 @@ static int l_system_heap_free(lua_State *L)
     return 1;
 }
 
+static int l_system_heap_info(lua_State *L)
+{
+    multi_heap_info_t info;
+    heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+    
+    lua_createtable(L, 0, 6);
+    lua_pushinteger(L, info.total_free_bytes);
+    lua_setfield(L, -2, "total_free");
+    lua_pushinteger(L, info.largest_free_block);
+    lua_setfield(L, -2, "largest_block");
+    lua_pushinteger(L, info.total_allocated_bytes);
+    lua_setfield(L, -2, "allocated");
+    lua_pushinteger(L, info.minimum_free_bytes);
+    lua_setfield(L, -2, "min_free");
+    lua_pushinteger(L, info.free_blocks);
+    lua_setfield(L, -2, "free_blocks");
+    lua_pushinteger(L, info.allocated_blocks);
+    lua_setfield(L, -2, "allocated_blocks");
+    return 1;
+}
+
+static int l_system_trim_heap(lua_State *L)
+{
+    (void)L;
+    malloc_trim(0);
+    ESP_LOGD(TAG, "Heap trimmed");
+    return 0;
+}
+
 static int l_system_uptime(lua_State *L)
 {
     lua_pushnumber(L, (double)esp_timer_get_time() / 1000000.0);
@@ -319,8 +349,10 @@ static int l_system_uptime(lua_State *L)
 }
 
 static const luaL_Reg system_lib[] = {
-    {"heap_free", l_system_heap_free},
-    {"uptime",    l_system_uptime},
+    {"heap_free",  l_system_heap_free},
+    {"heap_info",  l_system_heap_info},
+    {"trim_heap",  l_system_trim_heap},
+    {"uptime",     l_system_uptime},
     {NULL, NULL}
 };
 
@@ -498,6 +530,7 @@ static int l_i2c_scan(lua_State *L)
                 lua_pushinteger(L, addr);
                 lua_rawseti(L, -2, ++found);
             }
+            i2c_master_bus_rm_device(dev);
         }
     }
     return 1;
@@ -1240,6 +1273,37 @@ static void destroy_vm(lua_State *state)
     }
 }
 
+/* ── Load script with fallback (SPIFFS → embedded) ───────────────── */
+
+static int load_script_with_fallback(lua_State *L, const char *spiffs_path,
+                                     const char *default_script, size_t default_len)
+{
+    int ret = luaL_loadfile(L, spiffs_path);
+    if (ret == LUA_OK) {
+        ret = lua_pcall(L, 0, LUA_MULTRET, 0);
+        if (ret == LUA_OK) {
+            ESP_LOGI(TAG, "Loaded from SPIFFS: %s", spiffs_path);
+            return LUA_OK;
+        }
+        const char *err = lua_tostring(L, -1);
+        ESP_LOGW(TAG, "SPIFFS %s failed: %s, falling back to embedded",
+                 spiffs_path, err ? err : "unknown");
+        lua_pop(L, 1);
+    } else {
+        ESP_LOGW(TAG, "SPIFFS %s not found or load error, using embedded", spiffs_path);
+    }
+
+    ret = luaL_loadbuffer(L, default_script, default_len, "embedded_main");
+    if (ret == LUA_OK) {
+        ret = lua_pcall(L, 0, LUA_MULTRET, 0);
+        if (ret == LUA_OK) {
+            ESP_LOGI(TAG, "Loaded from embedded default");
+            return LUA_OK;
+        }
+    }
+    return ret;
+}
+
 /* ── Lua task (runs main.lua) ───────────────────────────────────── */
 
 static void lua_task(void *pvParameters)
@@ -1247,7 +1311,9 @@ static void lua_task(void *pvParameters)
     lua_task_running = true;
     ESP_LOGI(TAG, "Lua task started, executing main.lua");
 
-    int ret = luaL_dofile(L, SPIFFS_BASE_PATH "/main.lua");
+    int ret = load_script_with_fallback(L, SPIFFS_BASE_PATH "/main.lua",
+                                        (const char *)default_main_lua_start,
+                                        default_main_lua_end - default_main_lua_start);
     if (ret != LUA_OK) {
         const char *err = lua_tostring(L, -1);
         ESP_LOGE(TAG, "main.lua error: %s", err ? err : "unknown");

@@ -119,7 +119,11 @@ bool check_client_alive_cb(wss_keep_alive_t h, int fd)
     if (!resp_arg) return false;
     resp_arg->hd = wss_keep_alive_get_user_ctx(h);
     resp_arg->fd = fd;
-    return httpd_queue_work(resp_arg->hd, send_ping, resp_arg) == ESP_OK;
+    if (httpd_queue_work(resp_arg->hd, send_ping, resp_arg) != ESP_OK) {
+        free(resp_arg);
+        return false;
+    }
+    return true;
 }
 
 /* --- Plain HTTP server (no TLS, for easier MCP client testing) --- */

@@ -127,12 +127,14 @@ esp_err_t mcp_handle_tools_call(cJSON *params, cJSON **result)
 
     // Extract arguments
     cJSON *arguments = cJSON_GetObjectItem(params, "arguments");
+    cJSON *owned_args = NULL;
     if (!arguments) {
-        // Create empty arguments object if not provided
-        arguments = cJSON_CreateObject();
-        if (!arguments) {
+        /* Create empty arguments object if not provided */
+        owned_args = cJSON_CreateObject();
+        if (!owned_args) {
             return ESP_ERR_NO_MEM;
         }
+        arguments = owned_args;
     }
 
     ESP_LOGI(TAG, "Calling tool: %s", tool_name);
@@ -141,6 +143,11 @@ esp_err_t mcp_handle_tools_call(cJSON *params, cJSON **result)
     char result_text[CONFIG_MCP_MAX_TOOL_RESULT_SIZE]; // MCP_MAX_TOOL_RESULT_SIZE
     bool is_error = false;
     esp_err_t ret = mcp_tools_execute(tool_name, arguments, result_text, sizeof(result_text), &is_error);
+
+    /* Free locally-created arguments object */
+    if (owned_args) {
+        cJSON_Delete(owned_args);
+    }
 
     // Create result object
     cJSON *response = cJSON_CreateObject();
