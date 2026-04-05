@@ -126,8 +126,25 @@ char* jsonrpc_create_response(int id, cJSON *result)
     } else {
         // Primitive type, wrap in a generic object
         cJSON *result_obj = cJSON_CreateObject();
-        cJSON_AddItemToObject(result_obj, "value", result);
-        cJSON_AddItemToObject(response, "result", result_obj);
+        if (!result_obj) {
+            ESP_LOGE(TAG, "Failed to create result wrapper object");
+            cJSON_Delete(response);
+            cJSON_Delete(result);
+            return NULL;
+        }
+        if (!cJSON_AddItemToObject(result_obj, "value", result)) {
+            ESP_LOGE(TAG, "Failed to add value to result object");
+            cJSON_Delete(result_obj);
+            cJSON_Delete(response);
+            cJSON_Delete(result);
+            return NULL;
+        }
+        if (!cJSON_AddItemToObject(response, "result", result_obj)) {
+            ESP_LOGE(TAG, "Failed to add result to response");
+            cJSON_Delete(result_obj);
+            cJSON_Delete(response);
+            return NULL;
+        }
     }
 
     char *json_str = cJSON_PrintUnformatted(response);
@@ -135,7 +152,9 @@ char* jsonrpc_create_response(int id, cJSON *result)
     if (json_str) {
         ESP_LOGD(TAG, ">>> Response JSON: %s", json_str);
     } else {
-        ESP_LOGE(TAG, ">>> cJSON_PrintUnformatted FAILED!");
+        ESP_LOGE(TAG, ">>> cJSON_PrintUnformatted FAILED! Deleting response and returning NULL");
+        cJSON_Delete(response);
+        return NULL;
     }
     
     cJSON_Delete(response);

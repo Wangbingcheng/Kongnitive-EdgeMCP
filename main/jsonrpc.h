@@ -87,6 +87,11 @@ char* jsonrpc_create_error(int id, int code, const char *message);
  */
 void jsonrpc_message_cleanup(jsonrpc_message_t *msg);
 
+/**
+ * Static error response for cJSON print failures
+ */
+#define JSONRPC_STATIC_ERROR "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}"
+
 #ifdef __cplusplus
 }
 #endif

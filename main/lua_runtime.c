@@ -28,6 +28,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <esp_attr.h>
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -37,7 +38,7 @@ static const char *TAG = "lua_rt";
 
 #define SPIFFS_BASE_PATH "/spiffs"
 #define LUA_TASK_STACK   6144
-#define LUA_TASK_PRIO    5
+#define LUA_TASK_PRIO    3
 
 static lua_State *L = NULL;
 static TaskHandle_t lua_task_handle = NULL;
@@ -747,6 +748,7 @@ static volatile bool lcd_dma_busy = false;
 static SemaphoreHandle_t lcd_flush_sem = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
+static bool lcd_initialized = false;
 
 static int dirty_x1 = LCD_WIDTH, dirty_y1 = LCD_HEIGHT, dirty_x2 = 0, dirty_y2 = 0;
 
@@ -787,6 +789,33 @@ static bool fb_has_dirty(void)
     return dirty_x2 > dirty_x1 && dirty_y2 > dirty_y1;
 }
 
+static bool lcd_alloc_framebuf(void)
+{
+    if (lcd_framebuf) return true;
+    
+    if (!lcd_initialized || !lcd_panel_handle) {
+        return false;
+    }
+    
+    lcd_framebuf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
+    if (!lcd_framebuf) {
+        ESP_LOGE(TAG, "Failed to allocate lazy frame buffer");
+        return false;
+    }
+    
+    lcd_flush_sem = xSemaphoreCreateBinary();
+    if (!lcd_flush_sem) {
+        heap_caps_free(lcd_framebuf);
+        lcd_framebuf = NULL;
+        return false;
+    }
+    
+    memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
+    fb_clear_dirty();
+    ESP_LOGI(TAG, "Lazy framebuffer allocated: %d bytes", LCD_WIDTH * LCD_HEIGHT * 2);
+    return true;
+}
+
 static bool on_color_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     (void)panel_io;
@@ -799,7 +828,7 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_pane
     return false;
 }
 
-/* 8x8 font (95 characters: 0x20-0x7E) */
+/* 8x8 font (95 characters: 0x20-0x7E) - const goes to flash by default on ESP32 */
 static const uint8_t FONT_8X8[95][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
     {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
@@ -1073,6 +1102,7 @@ static int l_lcd_setup(lua_State *L)
         memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
     }
 
+    lcd_initialized = true;
     ESP_LOGI(TAG, "ST7735 LCD initialized (single buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2);
     return 0;
 }
@@ -1080,7 +1110,9 @@ static int l_lcd_setup(lua_State *L)
 static int l_lcd_clear(lua_State *L)
 {
     int color = luaL_optinteger(L, 1, 0);
-    if (!lcd_framebuf) return 0;
+    if (!lcd_framebuf) {
+        if (!lcd_alloc_framebuf()) return 0;
+    }
     
     uint16_t swapped = swap_bytes(color);
     for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
@@ -1098,6 +1130,10 @@ static int l_lcd_fill(lua_State *L)
     int h = luaL_checkinteger(L, 4);
     int color = luaL_checkinteger(L, 5);
     
+    if (!lcd_framebuf) {
+        if (!lcd_alloc_framebuf()) return 0;
+    }
+    
     fb_fill_rect(x, y, w, h, color);
     return 0;
 }
@@ -1107,6 +1143,10 @@ static int l_lcd_pixel(lua_State *L)
     int x = luaL_checkinteger(L, 1);
     int y = luaL_checkinteger(L, 2);
     int color = luaL_checkinteger(L, 3);
+    
+    if (!lcd_framebuf) {
+        if (!lcd_alloc_framebuf()) return 0;
+    }
     
     fb_set_pixel(x, y, color);
     fb_mark_dirty(x, y, 1, 1);
@@ -1120,6 +1160,10 @@ static int l_lcd_print(lua_State *L)
     
     size_t len = 0;
     const char *lua_str = luaL_checklstring(L, 3, &len);
+    
+    if (!lcd_framebuf) {
+        if (!lcd_alloc_framebuf()) return 0;
+    }
     
     char local_buf[64];
     if (len >= sizeof(local_buf)) {
@@ -1161,7 +1205,9 @@ static int l_lcd_draw_pixels(lua_State *L)
     }
     
     if (!lcd_framebuf) {
-        return luaL_error(L, "LCD not initialized");
+        if (!lcd_alloc_framebuf()) {
+            return luaL_error(L, "LCD not initialized");
+        }
     }
     
     int clipped_x = x;
@@ -1190,13 +1236,17 @@ static int l_lcd_draw_pixels(lua_State *L)
 static int l_lcd_flush(lua_State *L)
 {
     (void)L;
-    if (!lcd_framebuf || !lcd_panel_handle) return 0;
+    if (!lcd_panel_handle) return 0;
+    
+    if (!lcd_framebuf) {
+        if (!lcd_alloc_framebuf()) return 0;
+    }
 
     if (!fb_has_dirty()) {
         return 0;
     }
 
-    if (lcd_dma_busy) {
+    if (lcd_dma_busy && lcd_flush_sem) {
         xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
     }
 
@@ -1467,9 +1517,9 @@ esp_err_t lua_runtime_push_script(const char *name, const char *content, bool ap
     ESP_LOGI(TAG, "Script %s: %s (%d bytes)", append ? "appended" : "written",
              name, (int)strlen(content));
 
-    /* Force GC to free any accumulated memory from previous scripts */
+    /* Incremental GC to free accumulated memory from previous scripts */
     if (L) {
-        lua_gc(L, LUA_GCCOLLECT, 0);
+        lua_gc(L, LUA_GCSTEP, 10);
     }
 
     return ESP_OK;

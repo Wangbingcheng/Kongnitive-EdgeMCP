@@ -220,7 +220,7 @@ esp_err_t tool_sys_ota_push(cJSON *args, char *result, size_t max_len)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ret = xTaskCreate(ota_task, "ota_task", 6144, url, 5, NULL);
+    BaseType_t ret = xTaskCreate(ota_task, "ota_task", 6144, url, 4, NULL);
     if (ret != pdPASS) {
         free(url);
         snprintf(result, max_len, "Failed to create OTA task");

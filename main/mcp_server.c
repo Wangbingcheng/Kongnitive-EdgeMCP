@@ -11,6 +11,20 @@
 
 static const char *TAG = "mcp_server";
 
+#define WS_FRAME_BUF_SIZE CONFIG_MCP_MAX_MESSAGE_SIZE
+static uint8_t s_ws_frame_buf[WS_FRAME_BUF_SIZE];
+static char s_http_body_buf[CONFIG_MCP_MAX_MESSAGE_SIZE];
+
+void json_pool_init_hooks(void)
+{
+    cJSON_Hooks hooks = {
+        .malloc_fn = malloc,
+        .free_fn = free,
+    };
+    cJSON_InitHooks(&hooks);
+    ESP_LOGI(TAG, "cJSON hooks initialized");
+}
+
 // Method dispatch table
 typedef struct {
     const char *method;
@@ -28,6 +42,8 @@ static const mcp_method_entry_t method_table[] = {
 esp_err_t mcp_server_init(void)
 {
     ESP_LOGI(TAG, "Initializing MCP server");
+    
+    json_pool_init_hooks();
     
     esp_err_t ret = mcp_protocol_init();
     if (ret != ESP_OK) {
@@ -123,7 +139,6 @@ esp_err_t mcp_ws_handler(httpd_req_t *req)
     }
     
     httpd_ws_frame_t ws_pkt;
-    uint8_t *buf = NULL;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     
     // Get frame length
@@ -135,19 +150,14 @@ esp_err_t mcp_ws_handler(httpd_req_t *req)
     
     ESP_LOGD(TAG, "Received frame len: %d", ws_pkt.len);
     
-    if (ws_pkt.len) {
-        // Allocate buffer for message
-        buf = calloc(1, ws_pkt.len + 1);
-        if (buf == NULL) {
-            ESP_LOGE(TAG, "Failed to allocate memory for WebSocket frame");
-            return ESP_ERR_NO_MEM;
-        }
+    if (ws_pkt.len && ws_pkt.len <= WS_FRAME_BUF_SIZE) {
+        // Use static buffer instead of malloc
+        memset(s_ws_frame_buf, 0, WS_FRAME_BUF_SIZE);
+        ws_pkt.payload = s_ws_frame_buf;
         
-        ws_pkt.payload = buf;
         ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "httpd_ws_recv_frame failed: %s", esp_err_to_name(ret));
-            free(buf);
             return ret;
         }
         
@@ -183,8 +193,9 @@ esp_err_t mcp_ws_handler(httpd_req_t *req)
             ws_pkt.payload = NULL;
             ret = httpd_ws_send_frame(req, &ws_pkt);
         }
-        
-        free(buf);
+    } else if (ws_pkt.len > WS_FRAME_BUF_SIZE) {
+        ESP_LOGE(TAG, "WebSocket frame too large: %d > %d", ws_pkt.len, WS_FRAME_BUF_SIZE);
+        return ESP_ERR_NO_MEM;
     }
     
     return ret;
@@ -201,17 +212,13 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    char *body = calloc(1, content_len + 1);
-    if (!body) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_ERR_NO_MEM;
-    }
+    char *body = s_http_body_buf;
+    memset(body, 0, CONFIG_MCP_MAX_MESSAGE_SIZE);
 
     int received = 0;
     while (received < content_len) {
         int ret = httpd_req_recv(req, body + received, content_len - received);
         if (ret <= 0) {
-            free(body);
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
                 httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Timeout");
             }
@@ -225,18 +232,16 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
 
     /* Process through the same MCP pipeline as WebSocket */
     char *response = mcp_server_process_message(body);
-    free(body);
 
     if (response) {
         /* Normal request -> JSON response */
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, response, strlen(response));
+        
+        /* Always try to free - if it's static error, free won't hurt */
         free(response);
     } else {
-        /* This should not happen for requests - return error */
-        const char *err = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, err, strlen(err));
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to process MCP message");
     }
 
     return ESP_OK;

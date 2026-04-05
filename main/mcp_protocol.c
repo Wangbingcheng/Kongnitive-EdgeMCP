@@ -10,6 +10,9 @@
 static const char *TAG = "mcp_protocol";
 static bool initialized = false;
 
+#define TOOL_RESULT_BUF_SIZE 2048  /* Limit result to prevent JSON overflow */
+static char s_tool_result_buf[TOOL_RESULT_BUF_SIZE];
+
 esp_err_t mcp_protocol_init(void)
 {
     ESP_LOGI(TAG, "Initializing MCP protocol handler");
@@ -139,15 +142,10 @@ esp_err_t mcp_handle_tools_call(cJSON *params, cJSON **result)
 
     ESP_LOGI(TAG, "Calling tool: %s", tool_name);
 
-    // Execute tool
-    char result_text[CONFIG_MCP_MAX_TOOL_RESULT_SIZE]; // MCP_MAX_TOOL_RESULT_SIZE
+    // Execute tool (use static buffer to avoid stack overflow)
     bool is_error = false;
-    esp_err_t ret = mcp_tools_execute(tool_name, arguments, result_text, sizeof(result_text), &is_error);
-
-    /* Free locally-created arguments object */
-    if (owned_args) {
-        cJSON_Delete(owned_args);
-    }
+    memset(s_tool_result_buf, 0, TOOL_RESULT_BUF_SIZE);
+    esp_err_t ret = mcp_tools_execute(tool_name, arguments, s_tool_result_buf, TOOL_RESULT_BUF_SIZE - 1, &is_error);
 
     // Create result object
     cJSON *response = cJSON_CreateObject();
@@ -156,20 +154,17 @@ esp_err_t mcp_handle_tools_call(cJSON *params, cJSON **result)
         return ESP_ERR_NO_MEM;
     }
 
-    // Create content array
+    // Create content array and text block
     cJSON *content = cJSON_CreateArray();
     cJSON *text_block = cJSON_CreateObject();
     cJSON_AddStringToObject(text_block, "type", "text");
-    cJSON_AddStringToObject(text_block, "text", result_text);
+    cJSON_AddStringToObject(text_block, "text", s_tool_result_buf);
     cJSON_AddItemToArray(content, text_block);
     cJSON_AddItemToObject(response, "content", content);
 
     // Add isError flag if tool execution failed
     if (is_error || ret != ESP_OK) {
         cJSON_AddBoolToObject(response, "isError", true);
-        ESP_LOGW(TAG, "Tool execution failed: %s", result_text);
-    } else {
-        ESP_LOGI(TAG, "Tool executed successfully");
     }
 
     *result = response;
