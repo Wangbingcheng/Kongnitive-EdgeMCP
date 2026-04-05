@@ -7,6 +7,7 @@
 #include "mcp_protocol.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <esp_log.h>
 
 static const char *TAG = "mcp_server";
@@ -251,11 +252,14 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
 
 esp_err_t mcp_info_handler(httpd_req_t *req)
 {
-    const char *info =
+    char info[256];
+    snprintf(info, sizeof(info),
         "{\"name\":\"" MCP_SERVER_NAME "\","
         "\"version\":\"" MCP_SERVER_VERSION "\","
         "\"protocolVersion\":\"" MCP_PROTOCOL_VERSION "\","
-        "\"transports\":[\"http-post\",\"websocket\"]}";
+        "\"transports\":[\"http-post\",\"websocket\"],"
+        "\"maxMessageSize\":%d}",
+        CONFIG_MCP_MAX_MESSAGE_SIZE);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, info, strlen(info));

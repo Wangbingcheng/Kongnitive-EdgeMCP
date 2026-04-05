@@ -678,10 +678,21 @@ static esp_err_t tool_lua_push_script(cJSON *args, char *result, size_t max_len)
     esp_err_t ret = lua_runtime_push_script(name_item->valuestring,
                                              content_item->valuestring, append);
     if (ret == ESP_OK) {
-        snprintf(result, max_len, "Script '%s' %s (%d bytes)",
-                 name_item->valuestring,
-                 append ? "appended" : "written",
-                 (int)strlen(content_item->valuestring));
+        size_t content_len = strlen(content_item->valuestring);
+        if (content_len > (size_t)CONFIG_MCP_MAX_MESSAGE_SIZE - 500) {
+            snprintf(result, max_len,
+                "Script '%s' %s (%d bytes). "
+                "Note: For large scripts, use append=true with chunks up to %d bytes.",
+                name_item->valuestring,
+                append ? "appended" : "written",
+                (int)content_len,
+                CONFIG_MCP_MAX_MESSAGE_SIZE - 500);
+        } else {
+            snprintf(result, max_len, "Script '%s' %s (%d bytes)",
+                     name_item->valuestring,
+                     append ? "appended" : "written",
+                     (int)content_len);
+        }
     } else {
         snprintf(result, max_len, "Failed to write script '%s'", name_item->valuestring);
     }

@@ -547,6 +547,7 @@ static int l_i2c_scan(lua_State *L)
 static spi_device_handle_t spi_handle = NULL;
 static int spi_dc_pin = -1;
 static int spi_res_pin = -1;
+static bool spi_bus_initialized = false;
 
 static int l_spi_setup(lua_State *L)
 {
@@ -588,11 +589,17 @@ static int l_spi_setup(lua_State *L)
         .max_transfer_sz = SPI_WRITE_BUF_SZ,
     };
 
-    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        return luaL_error(L, "spi.setup bus failed: %s", esp_err_to_name(ret));
+    if (!spi_bus_initialized) {
+        esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+        if (ret != ESP_OK) {
+            return luaL_error(L, "spi.setup bus failed: %s", esp_err_to_name(ret));
+        }
+        spi_bus_initialized = true;
+    } else {
+        ESP_LOGW(TAG, "SPI bus already initialized, reusing");
     }
 
+    esp_err_t ret;
     spi_device_interface_config_t dev_cfg = {
         .command_bits = 0,
         .address_bits = 0,
@@ -1022,14 +1029,17 @@ static int l_lcd_setup(lua_State *L)
         .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2,
     };
 
-    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret == ESP_ERR_INVALID_STATE) {
+    if (!spi_bus_initialized) {
+        esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+        if (ret != ESP_OK) {
+            return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
+        }
+        spi_bus_initialized = true;
+    } else {
         ESP_LOGW(TAG, "ST7735: SPI bus already initialized, reusing");
-        ret = ESP_OK;
-    } else if (ret != ESP_OK) {
-        return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
     }
 
+    esp_err_t ret;
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num = dc,
         .cs_gpio_num = cs,
@@ -1429,6 +1439,9 @@ esp_err_t lua_runtime_restart(void)
     /* Free LCD buffers before destroying VM */
     lcd_free_buffers();
 
+    /* Reset SPI bus state for new VM */
+    spi_bus_initialized = false;
+
     /* Destroy and recreate VM (task is dead, safe to access directly) */
     destroy_vm(L);
     L = create_vm();
@@ -1521,16 +1534,24 @@ esp_err_t lua_runtime_push_script(const char *name, const char *content, bool ap
     char path[280];
     snprintf(path, sizeof(path), SPIFFS_BASE_PATH "/%s", name);
 
-    FILE *f = fopen(path, append ? "a" : "w");
+    const char *mode = append ? "a" : "w";
+    FILE *f = fopen(path, mode);
     if (!f) {
-        ESP_LOGE(TAG, "Failed to open %s for writing", path);
+        ESP_LOGE(TAG, "Failed to open %s for %s", path, mode);
         return ESP_FAIL;
     }
 
-    fputs(content, f);
+    size_t len = strlen(content);
+    size_t written = fwrite(content, 1, len, f);
+    fflush(f);
     fclose(f);
-    ESP_LOGI(TAG, "Script %s: %s (%d bytes)", append ? "appended" : "written",
-             name, (int)strlen(content));
+
+    if (written != len) {
+        ESP_LOGE(TAG, "Write failed: expected %d, wrote %d", (int)len, (int)written);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Script %s: %s (%d bytes)", name, append ? "appended" : "written", (int)len);
 
     /* Incremental GC to free accumulated memory from previous scripts */
     if (L) {
