@@ -50,6 +50,16 @@ esp_err_t lua_runtime_exec(const char *code, char *result, size_t max_len);
 esp_err_t lua_runtime_get_script(const char *name, char *buf, size_t max_len);
 
 /**
+ * Read a chunk of script from SPIFFS with offset and limit.
+ * @param name    Script filename
+ * @param buf     Output buffer
+ * @param max_len Size of buf
+ * @param offset  Byte offset to start reading
+ * @param limit   Max bytes to read (0 = unlimited)
+ */
+esp_err_t lua_runtime_get_script_chunk(const char *name, char *buf, size_t max_len, size_t offset, size_t limit);
+
+/**
  * Write/overwrite a script on SPIFFS.
  * @param name    Script filename
  * @param content Script source code

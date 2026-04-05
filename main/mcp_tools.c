@@ -123,7 +123,9 @@ static const mcp_tool_t tool_registry[] = {
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
-            "\"name\":{\"type\":\"string\",\"description\":\"Script filename (e.g. main.lua)\"}"
+            "\"name\":{\"type\":\"string\",\"description\":\"Script filename (e.g. main.lua)\"},"
+            "\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset to start reading\",\"default\":0},"
+            "\"limit\":{\"type\":\"integer\",\"description\":\"Max bytes to read (0=unlimited)\",\"default\":0}"
             "},"
             "\"required\":[\"name\"]}",
         .handler = tool_lua_get_script
@@ -694,6 +696,16 @@ static esp_err_t tool_lua_get_script(cJSON *args, char *result, size_t max_len)
         return ESP_ERR_INVALID_ARG;
     }
 
+    cJSON *offset_item = cJSON_GetObjectItem(args, "offset");
+    cJSON *limit_item = cJSON_GetObjectItem(args, "limit");
+    
+    size_t offset = offset_item ? (size_t)offset_item->valueint : 0;
+    size_t limit = limit_item ? (size_t)limit_item->valueint : 0;
+
+    if (offset > 0 || limit > 0) {
+        return lua_runtime_get_script_chunk(name_item->valuestring, result, max_len, offset, limit);
+    }
+    
     return lua_runtime_get_script(name_item->valuestring, result, max_len);
 }
 

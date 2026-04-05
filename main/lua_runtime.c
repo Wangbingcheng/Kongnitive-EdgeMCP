@@ -1477,6 +1477,11 @@ esp_err_t lua_runtime_exec(const char *code, char *result, size_t max_len)
 
 esp_err_t lua_runtime_get_script(const char *name, char *buf, size_t max_len)
 {
+    return lua_runtime_get_script_chunk(name, buf, max_len, 0, 0);
+}
+
+esp_err_t lua_runtime_get_script_chunk(const char *name, char *buf, size_t max_len, size_t offset, size_t limit)
+{
     if (!name || !buf) return ESP_ERR_INVALID_ARG;
 
     char path[280];
@@ -1488,9 +1493,15 @@ esp_err_t lua_runtime_get_script(const char *name, char *buf, size_t max_len)
         return ESP_ERR_NOT_FOUND;
     }
 
+    // Skip offset bytes
+    if (offset > 0) {
+        fseek(f, offset, SEEK_SET);
+    }
+
+    size_t read_limit = (limit > 0 && limit < max_len - 1) ? limit : (max_len - 1);
     size_t total = 0;
-    while (total < max_len - 1) {
-        size_t n = fread(buf + total, 1, max_len - 1 - total, f);
+    while (total < read_limit) {
+        size_t n = fread(buf + total, 1, read_limit - total, f);
         if (n == 0) break;
         total += n;
     }
