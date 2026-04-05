@@ -10,8 +10,7 @@
 static const char *TAG = "mcp_protocol";
 static bool initialized = false;
 
-#define TOOL_RESULT_BUF_SIZE 2048  /* Limit result to prevent JSON overflow */
-static char s_tool_result_buf[TOOL_RESULT_BUF_SIZE];
+static char s_tool_result_buf[MCP_MAX_TOOL_RESULT_SIZE];
 
 esp_err_t mcp_protocol_init(void)
 {
@@ -144,8 +143,8 @@ esp_err_t mcp_handle_tools_call(cJSON *params, cJSON **result)
 
     // Execute tool (use static buffer to avoid stack overflow)
     bool is_error = false;
-    memset(s_tool_result_buf, 0, TOOL_RESULT_BUF_SIZE);
-    esp_err_t ret = mcp_tools_execute(tool_name, arguments, s_tool_result_buf, TOOL_RESULT_BUF_SIZE - 1, &is_error);
+    memset(s_tool_result_buf, 0, MCP_MAX_TOOL_RESULT_SIZE);
+    esp_err_t ret = mcp_tools_execute(tool_name, arguments, s_tool_result_buf, MCP_MAX_TOOL_RESULT_SIZE - 1, &is_error);
 
     // Create result object
     cJSON *response = cJSON_CreateObject();
