@@ -12,6 +12,13 @@ Kongnitive EdgeMCP is an ESP32 MCP server with an embedded Lua 5.4 runtime. AI a
 
 ## Build Commands
 
+### ESP-IDF Version
+This project uses **ESP-IDF v6.0**. Use the correct path:
+```bash
+# Correct path for v6.0
+. /home/bing/.espressif/v6.0/esp-idf/export.sh
+```
+
 ### Basic Build Workflow
 ```bash
 # Export ESP-IDF environment
@@ -265,6 +272,29 @@ For runtime behavior changes, prefer Lua over C:
 - Use DI container: `di_container.lua`, `bindings.lua`
 - Keep configuration in bindings.lua (addresses, pins, options)
 - Use `lua_push_script` + `lua_restart` for deployment
+
+## Embedded Scripts
+
+### How Embedded Scripts Work
+- Default Lua scripts are embedded via `EMBED_TXTFILES` in `main/CMakeLists.txt`
+- Scripts are converted to `.S` assembly with `.byte` directives
+- Length is declared via `.long` (e.g., `.long 2579` = script length without null)
+- Symbol `default_main_lua_length` provides the correct length at runtime
+
+### Reading Embedded Script Length
+```c
+// Correct: use the length symbol (declared in .S file)
+extern const uint32_t default_main_lua_length asm("default_main_lua_length");
+
+// Wrong: end - start includes null terminator (2580 vs 2579)
+size_t len = default_main_lua_end - default_main_lua_start; // WRONG
+```
+
+### Extracting Embedded Script for Debugging
+```bash
+# Extract from .S file (only .byte lines, exact length)
+grep "^.byte" build/default_main.lua.S | sed 's/^\.byte //' | tr -d ' \n' | xxd -r -p | head -c 2579 > extracted.lua
+```
 
 ## Important Files
 

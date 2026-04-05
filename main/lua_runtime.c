@@ -130,6 +130,7 @@ extern const uint8_t default_provider_sht40_lua_start[] asm("_binary_default_pro
 extern const uint8_t default_bindings_lua_start[] asm("_binary_default_bindings_lua_start");
 extern const uint8_t default_main_lua_start[] asm("_binary_default_main_lua_start");
 extern const uint8_t default_main_lua_end[] asm("_binary_default_main_lua_end");
+extern const uint32_t default_main_lua_length asm("default_main_lua_length");
 
 /* ── SPIFFS helpers ─────────────────────────────────────────────── */
 
@@ -1022,7 +1023,10 @@ static int l_lcd_setup(lua_State *L)
     };
 
     esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "ST7735: SPI bus already initialized, reusing");
+        ret = ESP_OK;
+    } else if (ret != ESP_OK) {
         return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
     }
 
@@ -1050,7 +1054,7 @@ static int l_lcd_setup(lua_State *L)
 
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = res,
-        .rgb_endian = LCD_RGB_ENDIAN_BGR,
+        .data_endian = LCD_RGB_DATA_ENDIAN_BIG,
         .bits_per_pixel = 16,
         .flags.reset_active_high = false,
         .vendor_config = &vendor_config,
@@ -1363,7 +1367,7 @@ static void lua_task(void *pvParameters)
 
     int ret = load_script_with_fallback(L, SPIFFS_BASE_PATH "/main.lua",
                                         (const char *)default_main_lua_start,
-                                        default_main_lua_end - default_main_lua_start);
+                                        default_main_lua_length);
     if (ret != LUA_OK) {
         const char *err = lua_tostring(L, -1);
         ESP_LOGE(TAG, "main.lua error: %s", err ? err : "unknown");

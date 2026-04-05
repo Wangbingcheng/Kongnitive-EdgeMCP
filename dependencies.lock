@@ -1,18 +1,21 @@
 dependencies:
-  idf:
-    source:
-      type: idf
-    version: 5.4.0
-  waveshare/esp_lcd_st7735:
-    component_hash: 811c4168555af5878eb9ec8c3eee8af277afebc3bc516bc0daa57656eee09c69
-    dependencies: []
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.0.1
+    version: 1.7.19~2
+  idf:
+    source:
+      type: idf
+    version: 6.0.0
 direct_dependencies:
+- espressif/cjson
 - idf
-- waveshare/esp_lcd_st7735
-manifest_hash: 04e9d567acfb45335880e8b72593069ee95e59509ae0c769c41d9138d18e09c0
+manifest_hash: bbc16641daf232b0fcb66eebf8fb475be7ebf6782808c61b3c8c90e4eb33b05e
 target: esp32c3
-version: 2.0.0
+version: 3.0.0
