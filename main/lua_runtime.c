@@ -37,7 +37,7 @@
 static const char *TAG = "lua_rt";
 
 #define SPIFFS_BASE_PATH "/spiffs"
-#define LUA_TASK_STACK   6144
+#define LUA_TASK_STACK   8192  /* 8KB for larger Lua scripts */
 #define LUA_TASK_PRIO    3
 
 static lua_State *L = NULL;
@@ -1439,8 +1439,9 @@ esp_err_t lua_runtime_restart(void)
     /* Free LCD buffers before destroying VM */
     lcd_free_buffers();
 
-    /* Reset SPI bus state for new VM */
-    spi_bus_initialized = false;
+    /* Note: DO NOT reset spi_bus_initialized here!
+     * The SPI bus is still initialized in ESP-IDF, we just need to
+     * reuse it. The flag ensures we don't reinitialize. */
 
     /* Destroy and recreate VM (task is dead, safe to access directly) */
     destroy_vm(L);

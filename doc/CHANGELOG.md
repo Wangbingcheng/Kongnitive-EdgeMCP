@@ -15,7 +15,26 @@
   - `bg` parameter: nil for transparent background
   - Replaces old `lcd.print()` and `lcd.print_2x()` functions
 
+- MCP server capabilities endpoint
+  - GET /mcp returns capabilities object with:
+    - `maxMessageSize`: 16384 (16KB)
+    - `maxToolResultSize`: 8192 (8KB)
+    - `maxScriptSize`: 15884 (15.5KB)
+    - `supportsChunkedUpload`: true
+    - `supportsChunkedDownload`: true
+  - Tool descriptions updated with size limits
+
+- Heap memory check before large script push
+  - Rejects scripts >8KB if free heap <32KB
+
 ### Changed
+
+- Increased MCP server limits
+  - `CONFIG_MCP_MAX_MESSAGE_SIZE`: 4096 → 16384
+  - `CONFIG_MCP_MAX_TOOL_RESULT_SIZE`: 2048 → 8192
+  - HTTP/HTTPS server stack: 8192 → 12288
+  - Lua task stack: 6144 → 8192
+  - OTA task stack: 6144 → 8192
 
 - `lcd.clear()` now fills frame buffer instead of direct SPI transfer
 - `lcd.fill()` now writes to frame buffer
@@ -32,6 +51,8 @@
 - **CRITICAL**: Memory leak in `mcp_handle_tools_call` — `cJSON_CreateObject()` for missing `arguments` was never freed (`mcp_protocol.c:132`)
 - **MEDIUM**: Memory leak in `check_client_alive_cb` — `async_resp_arg` leaked when `httpd_queue_work()` fails (`main.c:118`)
 - **LOW**: I2C scan leak — devices added during scan were never removed (`lua_runtime.c:527`)
+- SPI bus reinitialization issue on lua_restart — use flag to track bus state instead of reinitializing
+- SPIFFS append bug — use fwrite + fflush instead of fputs
 
 ### Removed
 
@@ -61,10 +82,43 @@ static inline uint16_t swap_bytes(uint16_t val) {
 }
 ```
 
+### Memory Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ESP32-C3 RAM (约 240KB)                    │
+├─────────────────────────────────────────────────────────────┤
+│ 静态全局区 (编译时确定，不占栈空间)                            │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ s_http_body_buf[16384]     ← HTTP 请求体 (16KB)          │ │
+│ │ s_ws_frame_buf[16384]      ← WebSocket 帧 (16KB)         │ │
+│ └─────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────┤
+│ 堆 (Heap) - 动态分配                                         │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ cJSON 解析树 (~2-4KB)                                    │ │
+│ │ Lua VM (~80-100KB)                                      │ │
+│ └─────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────┤
+│ 栈 (Stack) - HTTP 服务器任务                                 │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ mcp_http_handler 栈帧 (~5-6KB 使用)  ← 12KB 分配          │ │
+│ └─────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Key insight: The 15KB script payload is stored in `s_http_body_buf` (static), not on the stack. The stack only handles control flow (~5-6KB).
+
 ### Files Modified
 
 | File | Changes |
 |------|---------|
-| `main/lua_runtime.c` | Frame buffer, unified print, byte swap, removed unused functions |
+| `main/lua_runtime.c` | Frame buffer, unified print, byte swap, SPI bus state tracking, stack size |
 | `main/default_scripts/default_provider_st7735.lua` | Updated to use new API with flush() |
 | `main/default_scripts/default_main.lua` | Added sleep_ms() to prevent watchdog timeout |
+| `main/mcp_server.c` | Increased buffers, capabilities endpoint |
+| `main/mcp_tools.c` | Updated tool descriptions, heap check |
+| `main/mcp_protocol.c` | Increased tool result buffer |
+| `main/main.c` | Increased HTTP/HTTPS stack sizes |
+| `main/mcp_ota.c` | Increased OTA task stack size |
+| `sdkconfig.defaults` | Updated message size limits |

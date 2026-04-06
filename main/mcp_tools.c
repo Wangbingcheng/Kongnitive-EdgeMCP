@@ -13,6 +13,7 @@
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <esp_spiffs.h>
 #include <esp_wifi.h>
 #include <driver/gpio.h>
 
@@ -39,6 +40,7 @@ static esp_err_t tool_lua_list_scripts(cJSON *args, char *result, size_t max_len
 static esp_err_t tool_lua_exec(cJSON *args, char *result, size_t max_len);
 static esp_err_t tool_lua_restart(cJSON *args, char *result, size_t max_len);
 static esp_err_t tool_lua_bind_dependency(cJSON *args, char *result, size_t max_len);
+static esp_err_t tool_sys_test_spiffs(cJSON *args, char *result, size_t max_len);
 
 // Tool registry (static, compile-time)
 static const mcp_tool_t tool_registry[] = {
@@ -105,13 +107,19 @@ static const mcp_tool_t tool_registry[] = {
         .handler = tool_sys_reboot
     },
     {
+        .name = "sys_test_spiffs",
+        .description = "Test SPIFFS write/read capability with various sizes. Returns detailed diagnostic info.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = tool_sys_test_spiffs
+    },
+    {
         .name = "lua_push_script",
-        .description = "Write or update a Lua script on the device. Use append=true for large scripts sent in chunks.",
+        .description = "Write or update a Lua script on the device. Use append=true for large scripts sent in chunks (max single chunk: 15884 bytes).",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
             "\"name\":{\"type\":\"string\",\"description\":\"Script filename (e.g. main.lua)\"},"
-            "\"content\":{\"type\":\"string\",\"description\":\"Lua source code\"},"
+            "\"content\":{\"type\":\"string\",\"description\":\"Lua source code (max 15884 bytes per call, use append=true for larger)\"},"
             "\"append\":{\"type\":\"boolean\",\"description\":\"Append to existing file instead of overwrite\",\"default\":false}"
             "},"
             "\"required\":[\"name\",\"content\"]}",
@@ -119,13 +127,13 @@ static const mcp_tool_t tool_registry[] = {
     },
     {
         .name = "lua_get_script",
-        .description = "Read a Lua script's source code from the device",
+        .description = "Read a Lua script's source code from the device (max 8192 bytes per call, use offset/limit for larger)",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
             "\"name\":{\"type\":\"string\",\"description\":\"Script filename (e.g. main.lua)\"},"
             "\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset to start reading\",\"default\":0},"
-            "\"limit\":{\"type\":\"integer\",\"description\":\"Max bytes to read (0=unlimited)\",\"default\":0}"
+            "\"limit\":{\"type\":\"integer\",\"description\":\"Max bytes to read (0=unlimited, max 8192)\",\"default\":0}"
             "},"
             "\"required\":[\"name\"]}",
         .handler = tool_lua_get_script
@@ -675,10 +683,18 @@ static esp_err_t tool_lua_push_script(cJSON *args, char *result, size_t max_len)
         append = true;
     }
 
+    /* Check heap memory before writing large script */
+    size_t content_len = strlen(content_item->valuestring);
+    uint32_t free_heap = esp_get_free_heap_size();
+    if (content_len > 8000 && free_heap < 32768) {
+        snprintf(result, max_len, "Insufficient heap: %lu bytes free, need ~32KB for %d bytes script",
+                 (unsigned long)free_heap, (int)content_len);
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_err_t ret = lua_runtime_push_script(name_item->valuestring,
                                              content_item->valuestring, append);
     if (ret == ESP_OK) {
-        size_t content_len = strlen(content_item->valuestring);
         if (content_len > (size_t)CONFIG_MCP_MAX_MESSAGE_SIZE - 500) {
             snprintf(result, max_len,
                 "Script '%s' %s (%d bytes). "
@@ -747,4 +763,137 @@ static esp_err_t tool_lua_restart(cJSON *args, char *result, size_t max_len)
         snprintf(result, max_len, "Failed to restart Lua VM");
     }
     return ret;
+}
+
+static esp_err_t tool_sys_test_spiffs(cJSON *args, char *result, size_t max_len)
+{
+    (void)args;
+    int offset = 0;
+
+    /* Get SPIFFS info */
+    size_t total = 0, used = 0;
+    esp_err_t err = esp_spiffs_info("storage", &total, &used);
+    if (err == ESP_OK) {
+        offset += snprintf(result + offset, max_len - offset,
+            "=== SPIFFS Info ===\nTotal: %d bytes\nUsed: %d bytes\nFree: %d bytes\n\n",
+            (int)total, (int)used, (int)(total - used));
+    } else {
+        offset += snprintf(result + offset, max_len - offset,
+            "SPIFFS info failed: %s\n\n", esp_err_to_name(err));
+    }
+
+    /* Test various sizes */
+    int sizes[] = {50, 100, 200, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000};
+    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+
+    offset += snprintf(result + offset, max_len - offset, "=== Write Tests ===\n");
+
+    for (int i = 0; i < num_sizes; i++) {
+        int sz = sizes[i];
+        char path[64];
+        snprintf(path, sizeof(path), "/spiffs/test_%d.bin", sz);
+
+        /* Create test data with recognizable pattern */
+        char *data = malloc(sz);
+        if (!data) {
+            offset += snprintf(result + offset, max_len - offset,
+                "Size %d: MALLOC FAILED\n", sz);
+            continue;
+        }
+        /* Pattern: first byte = 'A'+i, last byte = 'Z', middle = 'X' */
+        memset(data, 'X', sz);
+        data[0] = (char)('A' + (i % 26));
+        if (sz > 1) data[sz-1] = 'Z';
+
+        /* Write */
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            offset += snprintf(result + offset, max_len - offset,
+                "Size %d: OPEN WRITE FAILED\n", sz);
+            free(data);
+            continue;
+        }
+
+        size_t written = fwrite(data, 1, sz, f);
+        int flush_ret = fflush(f);
+        int close_ret = fclose(f);
+
+        /* Read back */
+        f = fopen(path, "r");
+        if (!f) {
+            offset += snprintf(result + offset, max_len - offset,
+                "Size %d: OPEN READ FAILED (wrote=%d)\n", sz, (int)written);
+            free(data);
+            continue;
+        }
+
+        fseek(f, 0, SEEK_END);
+        long actual = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        /* Verify content */
+        char *read_buf = malloc(sz);
+        int match = 0;
+        if (read_buf) {
+            size_t rd = fread(read_buf, 1, sz, f);
+            match = (rd == (size_t)sz) &&
+                    (read_buf[0] == data[0]) &&
+                    (read_buf[sz-1] == data[sz-1]);
+            free(read_buf);
+        }
+        fclose(f);
+
+        /* Cleanup */
+        remove(path);
+        free(data);
+
+        /* Result */
+        offset += snprintf(result + offset, max_len - offset,
+            "Size %d: wrote=%d, actual=%d, flush=%d, close=%d, match=%d %s\n",
+            sz, (int)written, (int)actual, flush_ret, close_ret, match,
+            (written == (size_t)sz && actual == sz && match) ? "OK" : "FAIL");
+    }
+
+    /* Append test */
+    offset += snprintf(result + offset, max_len - offset, "\n=== Append Test ===\n");
+
+    char *test_appends[] = {"FIRST", "SECOND", "THIRD"};
+    int num_appends = sizeof(test_appends) / sizeof(test_appends[0]);
+
+    FILE *f = fopen("/spiffs/test_append.bin", "w");
+    fclose(f);  /* Create empty file */
+
+    for (int i = 0; i < num_appends; i++) {
+        f = fopen("/spiffs/test_append.bin", "a");
+        if (!f) {
+            offset += snprintf(result + offset, max_len - offset,
+                "Append %d: OPEN FAILED\n", i);
+            continue;
+        }
+        size_t written = fwrite(test_appends[i], 1, strlen(test_appends[i]), f);
+        fflush(f);
+        fclose(f);
+        offset += snprintf(result + offset, max_len - offset,
+            "Append %d: wrote %d bytes\n", i, (int)written);
+    }
+
+    /* Verify append */
+    f = fopen("/spiffs/test_append.bin", "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long append_actual = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char buf[64] = {0};
+        fread(buf, 1, sizeof(buf), f);
+        fclose(f);
+        offset += snprintf(result + offset, max_len - offset,
+            "Append total: %d bytes, content: '%s' %s\n",
+            (int)append_actual, buf,
+            (append_actual == 16) ? "OK" : "FAIL");
+    } else {
+        offset += snprintf(result + offset, max_len - offset, "Append verify FAILED\n");
+    }
+    remove("/spiffs/test_append.bin");
+
+    return ESP_OK;
 }

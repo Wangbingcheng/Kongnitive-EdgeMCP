@@ -252,14 +252,22 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
 
 esp_err_t mcp_info_handler(httpd_req_t *req)
 {
-    char info[256];
+    char info[512];
     snprintf(info, sizeof(info),
         "{\"name\":\"" MCP_SERVER_NAME "\","
         "\"version\":\"" MCP_SERVER_VERSION "\","
         "\"protocolVersion\":\"" MCP_PROTOCOL_VERSION "\","
         "\"transports\":[\"http-post\",\"websocket\"],"
-        "\"maxMessageSize\":%d}",
-        CONFIG_MCP_MAX_MESSAGE_SIZE);
+        "\"capabilities\":{"
+        "\"maxMessageSize\":%d,"
+        "\"maxToolResultSize\":%d,"
+        "\"maxScriptSize\":%d,"
+        "\"supportsChunkedUpload\":true,"
+        "\"supportsChunkedDownload\":true"
+        "}}",
+        CONFIG_MCP_MAX_MESSAGE_SIZE,
+        CONFIG_MCP_MAX_TOOL_RESULT_SIZE,
+        CONFIG_MCP_MAX_MESSAGE_SIZE - 500);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, info, strlen(info));

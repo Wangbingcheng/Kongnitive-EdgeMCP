@@ -137,7 +137,7 @@ static httpd_handle_t start_http_server(void)
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
     config.lru_purge_enable = true;
-    config.stack_size = 8192;
+    config.stack_size = 12288;  /* 12KB for larger JSON payloads */
 
     esp_err_t ret = httpd_start(&server, &config);
     if (ret != ESP_OK) {
@@ -168,7 +168,7 @@ static httpd_handle_t start_mcp_server(void)
 
     httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
     conf.httpd.max_open_sockets = max_clients;
-    conf.httpd.stack_size = 8192;
+    conf.httpd.stack_size = 12288;  /* 12KB for larger JSON payloads */
     conf.httpd.global_user_ctx = keep_alive;
     conf.httpd.open_fn = wss_open_fd;
     conf.httpd.close_fn = wss_close_fd;
