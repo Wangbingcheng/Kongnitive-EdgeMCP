@@ -208,8 +208,17 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
 {
     /* Read POST body */
     int content_len = req->content_len;
-    if (content_len <= 0 || content_len > CONFIG_MCP_MAX_MESSAGE_SIZE) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+    if (content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request body");
+        return ESP_FAIL;
+    }
+    if (content_len > CONFIG_MCP_MAX_MESSAGE_SIZE) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), 
+            "Request body too large: %d bytes (max: %d). "
+            "Use append=true for large scripts.", 
+            content_len, CONFIG_MCP_MAX_MESSAGE_SIZE);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
         return ESP_FAIL;
     }
 
@@ -221,7 +230,7 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
         int ret = httpd_req_recv(req, body + received, content_len - received);
         if (ret <= 0) {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
-                httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Timeout");
+                httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Request timeout");
             }
             return ESP_FAIL;
         }
@@ -242,7 +251,12 @@ esp_err_t mcp_http_handler(httpd_req_t *req)
         /* Always try to free - if it's static error, free won't hurt */
         free(response);
     } else {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to process MCP message");
+        /* Failed to process - try to get detailed error from JSON-RPC */
+        httpd_resp_set_type(req, "application/json");
+        const char *err_resp = 
+            "{\"jsonrpc\":\"2.0\",\"error\":"
+            "{\"code\":-32603,\"message\":\"Internal error: failed to build response\"}}";
+        httpd_resp_send(req, err_resp, strlen(err_resp));
     }
 
     return ESP_OK;
