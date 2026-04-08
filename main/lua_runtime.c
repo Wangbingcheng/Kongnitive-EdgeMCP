@@ -18,6 +18,7 @@
 #include <esp_spiffs.h>
 #include <esp_heap_caps.h>
 #include <driver/gpio.h>
+#include <driver/ledc.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
 #include <esp_lcd_panel_io.h>
@@ -751,6 +752,7 @@ static int lcd_dc_pin = -1;
 static int lcd_cs_pin = -1;
 static int lcd_res_pin = -1;
 static int lcd_bl_pin = -1;
+static bool lcd_bl_pwm_initialized = false;
 static uint16_t *lcd_framebuf = NULL;
 static volatile bool lcd_dma_busy = false;
 static SemaphoreHandle_t lcd_flush_sem = NULL;
@@ -1091,16 +1093,46 @@ static int l_lcd_setup(lua_State *L)
     }
 
     if (lcd_bl_pin >= 0) {
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << lcd_bl_pin),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
+        ledc_channel_config_t ledc_conf = {
+            .channel = LEDC_CHANNEL_0,
+            .duty = 0,
+            .gpio_num = lcd_bl_pin,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .hpoint = 0,
+            .timer_sel = LEDC_TIMER_0,
         };
-        gpio_config(&io_conf);
-        gpio_set_level(lcd_bl_pin, 1);
-        ESP_LOGI(TAG, "ST7735: Backlight ON");
+        esp_err_t ret = ledc_channel_config(&ledc_conf);
+        if (ret == ESP_OK) {
+            ledc_timer_config_t timer_conf = {
+                .speed_mode = LEDC_LOW_SPEED_MODE,
+                .duty_resolution = LEDC_TIMER_8_BIT,
+                .timer_num = LEDC_TIMER_0,
+                .freq_hz = 1000,
+                .clk_cfg = LEDC_AUTO_CLK,
+            };
+            ret = ledc_timer_config(&timer_conf);
+            if (ret == ESP_OK) {
+                lcd_bl_pwm_initialized = true;
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 255);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                ESP_LOGI(TAG, "ST7735: Backlight PWM initialized (pin=%d)", lcd_bl_pin);
+            } else {
+                ESP_LOGW(TAG, "ST7735: Backlight timer config failed: %s, using GPIO", esp_err_to_name(ret));
+                goto bl_gpio_fallback;
+            }
+        } else {
+        bl_gpio_fallback:
+            gpio_config_t io_conf = {
+                .pin_bit_mask = (1ULL << lcd_bl_pin),
+                .mode = GPIO_MODE_OUTPUT,
+                .pull_up_en = GPIO_PULLUP_DISABLE,
+                .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            gpio_config(&io_conf);
+            gpio_set_level(lcd_bl_pin, 1);
+            ESP_LOGI(TAG, "ST7735: Backlight ON (GPIO mode)");
+        }
     }
 
     if (lcd_framebuf == NULL) {
@@ -1271,6 +1303,28 @@ static int l_lcd_flush(lua_State *L)
     return 0;
 }
 
+static int l_lcd_brightness(lua_State *L)
+{
+    int brightness = luaL_optinteger(L, 1, 255);
+    if (brightness < 0) brightness = 0;
+    if (brightness > 255) brightness = 255;
+
+    if (!lcd_bl_pwm_initialized) {
+        if (lcd_bl_pin >= 0) {
+            gpio_set_level(lcd_bl_pin, brightness > 127 ? 1 : 0);
+            ESP_LOGW(TAG, "ST7735: PWM not initialized, using GPIO on/off");
+        }
+        lua_pushinteger(L, brightness);
+        return 1;
+    }
+
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, brightness);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    ESP_LOGD(TAG, "ST7735: Brightness set to %d", brightness);
+    lua_pushinteger(L, brightness);
+    return 1;
+}
+
 static const luaL_Reg lcd_lib[] = {
     {"setup",       l_lcd_setup},
     {"clear",       l_lcd_clear},
@@ -1279,6 +1333,7 @@ static const luaL_Reg lcd_lib[] = {
     {"print",       l_lcd_print},
     {"draw_pixels", l_lcd_draw_pixels},
     {"flush",       l_lcd_flush},
+    {"brightness",  l_lcd_brightness},
     {NULL, NULL}
 };
 
@@ -1606,4 +1661,9 @@ esp_err_t lua_runtime_get_memory_usage(uint32_t *current_bytes, uint32_t *peak_b
     *current_bytes = lua_mem_current;
     *peak_bytes = lua_mem_peak;
     return ESP_OK;
+}
+
+void* lua_runtime_get_lua_state(void)
+{
+    return (void*)L;
 }

@@ -16,6 +16,7 @@
 #include <esp_spiffs.h>
 #include <esp_wifi.h>
 #include <driver/gpio.h>
+#include <lua.h>
 
 static const char *TAG = "mcp_tools";
 
@@ -41,6 +42,7 @@ static esp_err_t tool_lua_exec(cJSON *args, char *result, size_t max_len);
 static esp_err_t tool_lua_restart(cJSON *args, char *result, size_t max_len);
 static esp_err_t tool_lua_bind_dependency(cJSON *args, char *result, size_t max_len);
 static esp_err_t tool_sys_test_spiffs(cJSON *args, char *result, size_t max_len);
+static esp_err_t tool_lcd_brightness(cJSON *args, char *result, size_t max_len);
 
 // Tool registry (static, compile-time)
 static const mcp_tool_t tool_registry[] = {
@@ -111,6 +113,16 @@ static const mcp_tool_t tool_registry[] = {
         .description = "Test SPIFFS write/read capability with various sizes. Returns detailed diagnostic info.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
         .handler = tool_sys_test_spiffs
+    },
+    {
+        .name = "lcd_set_brightness",
+        .description = "Set LCD backlight brightness (0-255)",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"level\":{\"type\":\"integer\",\"description\":\"Brightness level (0-255, default 255)\",\"minimum\":0,\"maximum\":255}"
+            "}}",
+        .handler = tool_lcd_brightness
     },
     {
         .name = "lua_push_script",
@@ -895,5 +907,36 @@ static esp_err_t tool_sys_test_spiffs(cJSON *args, char *result, size_t max_len)
     }
     remove("/spiffs/test_append.bin");
 
+    return ESP_OK;
+}
+
+static esp_err_t tool_lcd_brightness(cJSON *args, char *result, size_t max_len)
+{
+    int level = 255;
+    cJSON *level_item = cJSON_GetObjectItem(args, "level");
+    if (level_item && cJSON_IsNumber(level_item)) {
+        level = level_item->valueint;
+    }
+    if (level < 0) level = 0;
+    if (level > 255) level = 255;
+
+    lua_State *L = lua_runtime_get_lua_state();
+    if (!L) {
+        snprintf(result, max_len, "Lua runtime not initialized");
+        return ESP_FAIL;
+    }
+
+    lua_getglobal(L, "lcd");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        snprintf(result, max_len, "LCD not initialized, call lcd.setup first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    lua_pushinteger(L, level);
+    lua_setfield(L, -2, "brightness");
+    lua_pop(L, 1);
+
+    snprintf(result, max_len, "LCD brightness set to %d", level);
     return ESP_OK;
 }

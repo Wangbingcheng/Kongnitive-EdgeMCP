@@ -81,6 +81,12 @@ esp_err_t lua_runtime_list_scripts(char *buf, size_t max_len);
  */
 esp_err_t lua_runtime_get_memory_usage(uint32_t *current_bytes, uint32_t *peak_bytes);
 
+/**
+ * Get the Lua state pointer for direct manipulation.
+ * @return Pointer to lua_State, or NULL if VM not initialized
+ */
+void* lua_runtime_get_lua_state(void);
+
 #ifdef __cplusplus
 }
 #endif
