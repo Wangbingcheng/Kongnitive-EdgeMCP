@@ -933,8 +933,20 @@ static esp_err_t tool_lcd_brightness(cJSON *args, char *result, size_t max_len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    lua_pushinteger(L, level);
-    lua_setfield(L, -2, "brightness");
+    lua_getfield(L, -1, "brightness");
+    if (lua_isfunction(L, -1)) {
+        lua_pushinteger(L, level);
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            const char *err = lua_tostring(L, -1);
+            snprintf(result, max_len, "LCD brightness error: %s", err ? err : "unknown");
+            lua_pop(L, 2);
+            return ESP_FAIL;
+        }
+    } else {
+        lua_pop(L, 1);
+        lua_pushinteger(L, level);
+        lua_setfield(L, -2, "brightness");
+    }
     lua_pop(L, 1);
 
     snprintf(result, max_len, "LCD brightness set to %d", level);
