@@ -753,6 +753,7 @@ static int lcd_cs_pin = -1;
 static int lcd_res_pin = -1;
 static int lcd_bl_pin = -1;
 static bool lcd_bl_pwm_initialized = false;
+static int lcd_brightness_val = 255;  // Default to full brightness
 static uint16_t *lcd_framebuf = NULL;
 static volatile bool lcd_dma_busy = false;
 static SemaphoreHandle_t lcd_flush_sem = NULL;
@@ -1309,6 +1310,8 @@ static int l_lcd_brightness(lua_State *L)
     if (brightness < 0) brightness = 0;
     if (brightness > 255) brightness = 255;
 
+    lcd_brightness_val = brightness;
+
     if (!lcd_bl_pwm_initialized) {
         if (lcd_bl_pin >= 0) {
             gpio_set_level(lcd_bl_pin, brightness > 127 ? 1 : 0);
@@ -1325,6 +1328,12 @@ static int l_lcd_brightness(lua_State *L)
     return 1;
 }
 
+static int l_lcd_get_brightness(lua_State *L)
+{
+    lua_pushinteger(L, lcd_brightness_val);
+    return 1;
+}
+
 static const luaL_Reg lcd_lib[] = {
     {"setup",       l_lcd_setup},
     {"clear",       l_lcd_clear},
@@ -1334,6 +1343,7 @@ static const luaL_Reg lcd_lib[] = {
     {"draw_pixels", l_lcd_draw_pixels},
     {"flush",       l_lcd_flush},
     {"brightness",  l_lcd_brightness},
+    {"get_brightness", l_lcd_get_brightness},
     {NULL, NULL}
 };
 

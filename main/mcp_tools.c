@@ -942,12 +942,15 @@ static esp_err_t tool_lcd_brightness(cJSON *args, char *result, size_t max_len)
             lua_pop(L, 2);
             return ESP_FAIL;
         }
-    } else {
+        // Function call succeeded, just pop the lcd table
         lua_pop(L, 1);
+    } else {
+        // brightness is not a function, set it as a value (fallback)
+        lua_pop(L, 1);  // remove nil
         lua_pushinteger(L, level);
         lua_setfield(L, -2, "brightness");
+        lua_pop(L, 1);  // pop lcd table
     }
-    lua_pop(L, 1);
 
     snprintf(result, max_len, "LCD brightness set to %d", level);
     return ESP_OK;
