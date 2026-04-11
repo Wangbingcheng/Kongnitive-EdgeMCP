@@ -145,6 +145,13 @@ Lua 不是绝对必须，但它是当前默认架构选择，目的是提升迭�
 
 ## For Developer
 
+### 开发者资源
+
+- **乐鑫文档 MCP 服务器**: `https://mcp.espressif.com/docs`
+  - 强烈建议 AI 代理和开发者使用此服务器搜索 ESP-IDF 文档。
+- **项目 AGENTS 指南**: [AGENTS.zh-CN.md](AGENTS.zh-CN.md)
+- **Agent 配置说明**: [MCP_AGENT_CONFIG.md](MCP_AGENT_CONFIG.md)
+
 ### 代码结构
 
 - `main/`：MCP server、协议、工具、运行时、OTA、Wi-Fi

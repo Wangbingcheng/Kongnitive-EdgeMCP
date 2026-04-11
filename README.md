@@ -145,6 +145,13 @@ How to verify:
 
 ## For Developer
 
+### Developer Resources
+
+- **Espressif Documentation MCP Server**: `https://mcp.espressif.com/docs`
+  - Highly recommended for AI agents and developers to search ESP-IDF documentation.
+- **Project AGENTS Guide**: [AGENTS.md](AGENTS.md)
+- **Agent Configuration**: [MCP_AGENT_CONFIG.md](MCP_AGENT_CONFIG.md)
+
 ### Code layout
 
 - `main/` - MCP server, protocol, tools, runtime, OTA, Wi-Fi

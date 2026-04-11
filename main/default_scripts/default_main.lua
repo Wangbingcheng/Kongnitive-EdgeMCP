@@ -24,6 +24,8 @@ end
 if not display then
     log.info("No display found")
     return
+else
+    display:init()
 end
 
 local base_heap = system.heap_free() or 0

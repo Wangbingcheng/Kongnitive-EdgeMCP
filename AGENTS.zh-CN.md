@@ -10,6 +10,13 @@ Kongnitive EdgeMCP 是一个运行在 ESP32 上的 MCP 服务器，内嵌 Lua 5.
 - **框架**: ESP-IDF v5.0+
 - **目标硬件**: ESP32（已验证：Seeed Studio XIAO ESP32S3）
 
+## 推荐工具
+
+### 乐鑫文档 MCP 服务器
+对于任何关于 ESP-IDF API、硬件细节或乐鑫框架的问题，请使用官方的乐鑫文档 MCP 服务器：
+- **URL**: `https://mcp.espressif.com/docs`
+- **功能**: 对所有乐鑫技术文档进行语义搜索。
+
 ## 构建命令
 
 ### 基本构建流程

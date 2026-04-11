@@ -46,9 +46,11 @@ static TaskHandle_t lua_task_handle = NULL;
 static volatile bool lua_task_running = false;
 static volatile uint32_t lua_mem_current = 0;
 static volatile uint32_t lua_mem_peak = 0;
+static portMUX_TYPE lua_mem_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void lua_mem_update(size_t old_size, size_t new_size)
 {
+    taskENTER_CRITICAL(&lua_mem_mux);
     uint32_t current = lua_mem_current;
     if (new_size >= old_size) {
         current += (uint32_t)(new_size - old_size);
@@ -61,6 +63,7 @@ static void lua_mem_update(size_t old_size, size_t new_size)
     if (current > lua_mem_peak) {
         lua_mem_peak = current;
     }
+    taskEXIT_CRITICAL(&lua_mem_mux);
 }
 
 static void *lua_tracking_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
@@ -77,6 +80,8 @@ static void *lua_tracking_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
 
     void *new_ptr = realloc(ptr, nsize);
     if (!new_ptr) {
+        // 如果realloc失败，我们不应该改变内存统计
+        // 仅在成功分配后才更新内存统计
         return NULL;
     }
 
@@ -100,6 +105,128 @@ static struct {
     i2c_master_dev_handle_t handle;
 } i2c_dev_cache[I2C_MAX_DEVICES];
 static int i2c_dev_count = 0;
+
+/*
+ * 把一个 Lua 值追加到字节缓冲区里。
+ *
+ * 这个函数是 SPI/I2C 写入路径的公共入口之一，
+ * 用来把 Lua 传进来的不同数据类型统一转换成 uint8_t 字节流。
+ *
+ * 支持的输入类型：
+ * 1. integer：追加 1 个字节
+ * 2. string：按原始字符串字节逐个追加
+ * 3. table：把数组形式 table 中的每个整数元素逐个追加
+ */
+static int lua_append_bytes_from_value(lua_State *L, int index, uint8_t *buf, int len, int max_len)
+{
+    /*
+     * 如果缓冲区已经满了，直接返回当前长度。
+     * 不再继续写，避免越界。
+     */
+    if (len >= max_len) {
+        return len;
+    }
+
+    /*
+     * 如果参数本身是整数，就把它当成一个字节写入。
+     * 这里会做 uint8_t 强制转换，因此只保留低 8 位。
+     */
+    if (lua_isinteger(L, index)) {
+        buf[len++] = (uint8_t)lua_tointeger(L, index);
+        return len;
+    }
+
+    /*
+     * 如果参数是字符串，就把字符串底层的每一个字节都复制进缓冲区。
+     * 这适合写寄存器命令、原始二进制片段、文本等场景。
+     */
+    if (lua_isstring(L, index)) {
+        size_t slen = 0;
+        const char *str = lua_tolstring(L, index, &slen);
+        for (size_t i = 0; i < slen && len < max_len; i++) {
+            buf[len++] = (uint8_t)str[i];
+        }
+        return len;
+    }
+
+    if (lua_istable(L, index)) {
+        /*
+         * 先把 index 转成“绝对栈索引”。
+         *
+         * 原因是：下面会反复调用 lua_rawgeti，把元素压到 Lua 栈顶。
+         * 如果继续使用相对索引，随着栈顶变化，原来的 table 位置也会“看起来变了”，
+         * 后续访问可能取错对象。
+         *
+         * lua_absindex 会把当前 index 固定成一个不会因栈变化而漂移的位置。
+         */
+        int abs_index = lua_absindex(L, index);
+        /*
+         * 读取 table 的数组长度。
+         * 这里假设传入的是一个按 1..N 排列的数组型 table。
+         */
+        int tlen = luaL_len(L, abs_index);
+        for (int i = 1; i <= tlen && len < max_len; i++) {
+            /*
+             * 取出 table[i]，压到栈顶。
+             * 取完后栈顶位置 -1 就是当前元素。
+             */
+            lua_rawgeti(L, abs_index, i);
+            /*
+             * 这里强制要求 table 中的每一个元素都是整数。
+             * 这样可以保证 table -> byte buffer 的语义明确，避免混入字符串/布尔值/子 table。
+             */
+            if (!lua_isinteger(L, -1)) {
+                /*
+                 * 出错前先把刚刚压栈的值弹掉，保持栈平衡。
+                 */
+                lua_pop(L, 1);
+                luaL_error(L, "byte table must contain integers");
+            }
+            /*
+             * 把当前元素转成 1 个字节写入缓冲区。
+             */
+            buf[len++] = (uint8_t)lua_tointeger(L, -1);
+            /*
+             * 当前元素已经处理完，从栈顶弹出。
+             */
+            lua_pop(L, 1);
+        }
+        return len;
+    }
+
+    /*
+     * 如果不是整数、字符串、table，就直接报错。
+     * 这样上层接口的输入类型约束就保持一致。
+     */
+    luaL_error(L, "expected integer, string, or table");
+    return len;
+}
+
+/*
+ * 把一段 Lua 参数区间扁平化成连续字节缓冲区。
+ *
+ * 例如：
+ * - (0x01, 0x02, 0x03)
+ * - ("abc")
+ * - ({0x01, 0x02}, "xy", 0xFF)
+ *
+ * 都会被转换成一段连续的字节数据。
+ *
+ * 这个函数被 I2C 和 SPI 的写路径共用，
+ * 目的是让两套接口接受完全一致的输入格式。
+ */
+static int lua_build_byte_buffer(lua_State *L, int start_index, int end_index, uint8_t *buf, int max_len)
+{
+    int len = 0;
+    /*
+     * 依次处理 [start_index, end_index] 范围内的每个 Lua 参数，
+     * 每个参数都交给 lua_append_bytes_from_value 继续展开。
+     */
+    for (int i = start_index; i <= end_index && len < max_len; i++) {
+        len = lua_append_bytes_from_value(L, i, buf, len, max_len);
+    }
+    return len;
+}
 
 static i2c_master_dev_handle_t i2c_get_device(uint16_t addr)
 {
@@ -381,21 +508,37 @@ static const luaL_Reg wifi_lib[] = {
 
 static int l_i2c_setup(lua_State *L)
 {
+    /* 第 1、2 个参数分别是 SDA / SCL 引脚号。 */
     int sda = luaL_checkinteger(L, 1);
     int scl = luaL_checkinteger(L, 2);
+    /* 第 3 个参数是 I2C 频率，默认 400kHz。 */
     int freq = luaL_optinteger(L, 3, 400000);
 
-    /* Clean up existing bus */
+    /* 当前实现把 I2C 主频上限限制在 1MHz。 */
+    if (freq > 1000000) {
+        freq = 1000000;
+    }
+
+    /*
+     * 如果此前已经初始化过 I2C 总线，
+     * 这里先把旧的 device 句柄和 bus 一起清掉，
+     * 避免重新 setup 时残留旧配置。
+     */
     if (i2c_bus_handle) {
         for (int i = 0; i < i2c_dev_count; i++) {
-            i2c_master_bus_rm_device(i2c_dev_cache[i].handle);
+            if (i2c_dev_cache[i].handle) {
+                i2c_master_bus_rm_device(i2c_dev_cache[i].handle);
+            }
         }
         i2c_dev_count = 0;
         i2c_del_master_bus(i2c_bus_handle);
         i2c_bus_handle = NULL;
     }
 
+    /* 记录当前 I2C 总线频率，后续 scan / add device 都会复用这个值。 */
     i2c_bus_freq = freq;
+
+    /* 构造 I2C 主机总线配置。 */
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = sda,
@@ -405,6 +548,7 @@ static int l_i2c_setup(lua_State *L)
         .flags.enable_internal_pullup = true,
     };
 
+    /* 调用 ESP-IDF 创建新的 I2C master bus。 */
     esp_err_t ret = i2c_new_master_bus(&bus_cfg, &i2c_bus_handle);
     if (ret != ESP_OK) {
         return luaL_error(L, "i2c.setup failed: %s", esp_err_to_name(ret));
@@ -414,36 +558,27 @@ static int l_i2c_setup(lua_State *L)
 
 static int l_i2c_write(lua_State *L)
 {
+    /* 第 1 个参数是 7 位 I2C 从设备地址。 */
     int addr = luaL_checkinteger(L, 1);
+    /* 获取 Lua 传进来的总参数个数。 */
     int nargs = lua_gettop(L);
 
+    /* 本地发送缓冲区，所有待发送数据最终都会扁平化到这里。 */
     uint8_t buf[I2C_WRITE_BUF_SZ];
-    int len = 0;
+    /*
+     * 从第 2 个参数开始，把整数 / 字符串 / table 统一展开为连续字节流。
+     * 这样 Lua 侧可以混合多种输入形式。
+     */
+    int len = lua_build_byte_buffer(L, 2, nargs, buf, I2C_WRITE_BUF_SZ);
 
-    for (int i = 2; i <= nargs && len < I2C_WRITE_BUF_SZ; i++) {
-        if (lua_isinteger(L, i)) {
-            buf[len++] = (uint8_t)lua_tointeger(L, i);
-        } else if (lua_isstring(L, i)) {
-            size_t slen;
-            const char *s = lua_tolstring(L, i, &slen);
-            for (size_t j = 0; j < slen && len < I2C_WRITE_BUF_SZ; j++) {
-                buf[len++] = (uint8_t)s[j];
-            }
-        } else if (lua_istable(L, i)) {
-            int tlen = luaL_len(L, i);
-            for (int j = 1; j <= tlen && len < I2C_WRITE_BUF_SZ; j++) {
-                lua_rawgeti(L, i, j);
-                buf[len++] = (uint8_t)lua_tointeger(L, -1);
-                lua_pop(L, 1);
-            }
-        }
-    }
-
+    /* 如果没有任何有效字节，就直接返回，不发送空事务。 */
     if (len == 0) return 0;
 
+    /* 获取或懒创建指定地址对应的 I2C 设备句柄。 */
     i2c_master_dev_handle_t dev = i2c_get_device(addr);
     if (!dev) return luaL_error(L, "i2c: cannot get device 0x%02X", addr);
 
+    /* 把扁平化后的字节流一次性发给目标设备。 */
     esp_err_t ret = i2c_master_transmit(dev, buf, len, I2C_TIMEOUT_MS);
     if (ret != ESP_OK) {
         return luaL_error(L, "i2c.write failed: %s", esp_err_to_name(ret));
@@ -453,19 +588,25 @@ static int l_i2c_write(lua_State *L)
 
 static int l_i2c_read(lua_State *L)
 {
+    /* 第 1 个参数是目标 I2C 地址。 */
     int addr = luaL_checkinteger(L, 1);
+    /* 第 2 个参数是希望读取的字节数。 */
     int rlen = luaL_checkinteger(L, 2);
+    /* 读取长度不能超过本地接收缓冲区容量。 */
     if (rlen > I2C_READ_BUF_SZ) rlen = I2C_READ_BUF_SZ;
 
+    /* 获取设备句柄，没有就报错。 */
     i2c_master_dev_handle_t dev = i2c_get_device(addr);
     if (!dev) return luaL_error(L, "i2c: cannot get device 0x%02X", addr);
 
+    /* 接收原始字节到本地缓冲区。 */
     uint8_t buf[I2C_READ_BUF_SZ];
     esp_err_t ret = i2c_master_receive(dev, buf, rlen, I2C_TIMEOUT_MS);
     if (ret != ESP_OK) {
         return luaL_error(L, "i2c.read failed: %s", esp_err_to_name(ret));
     }
 
+    /* 把 C 侧字节数组转换成 Lua 数组 table 返回给脚本。 */
     lua_createtable(L, rlen, 0);
     for (int i = 0; i < rlen; i++) {
         lua_pushinteger(L, buf[i]);
@@ -476,34 +617,32 @@ static int l_i2c_read(lua_State *L)
 
 static int l_i2c_write_read(lua_State *L)
 {
+    /* 第 1 个参数是设备地址。 */
     int addr = luaL_checkinteger(L, 1);
 
+    /*
+     * 第 2 个参数是写前导数据。
+     * 常见用法是先写寄存器地址，再紧接着读返回值。
+     */
     uint8_t wbuf[I2C_WRITE_BUF_SZ];
-    int wlen = 0;
+    int wlen = lua_build_byte_buffer(L, 2, 2, wbuf, I2C_WRITE_BUF_SZ);
 
-    if (lua_istable(L, 2)) {
-        int tlen = luaL_len(L, 2);
-        for (int j = 1; j <= tlen && wlen < I2C_WRITE_BUF_SZ; j++) {
-            lua_rawgeti(L, 2, j);
-            wbuf[wlen++] = (uint8_t)lua_tointeger(L, -1);
-            lua_pop(L, 1);
-        }
-    } else if (lua_isinteger(L, 2)) {
-        wbuf[wlen++] = (uint8_t)lua_tointeger(L, 2);
-    }
-
+    /* 第 3 个参数是希望读取的字节数。 */
     int rlen = luaL_checkinteger(L, 3);
     if (rlen > I2C_READ_BUF_SZ) rlen = I2C_READ_BUF_SZ;
 
+    /* 获取设备句柄。 */
     i2c_master_dev_handle_t dev = i2c_get_device(addr);
     if (!dev) return luaL_error(L, "i2c: cannot get device 0x%02X", addr);
 
+    /* 先发 wbuf，再连续读取 rbuf。 */
     uint8_t rbuf[I2C_READ_BUF_SZ];
     esp_err_t ret = i2c_master_transmit_receive(dev, wbuf, wlen, rbuf, rlen, I2C_TIMEOUT_MS);
     if (ret != ESP_OK) {
         return luaL_error(L, "i2c.write_read failed: %s", esp_err_to_name(ret));
     }
 
+    /* 把读回来的字节包装成 Lua table 返回。 */
     lua_createtable(L, rlen, 0);
     for (int i = 0; i < rlen; i++) {
         lua_pushinteger(L, rbuf[i]);
@@ -521,19 +660,19 @@ static int l_i2c_scan(lua_State *L)
     lua_createtable(L, 0, 0);
     int found = 0;
     for (int addr = 1; addr < 127; addr++) {
+        i2c_master_dev_handle_t dev = NULL;
         i2c_device_config_t cfg = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = addr,
             .scl_speed_hz = i2c_bus_freq,
         };
-        i2c_master_dev_handle_t dev = NULL;
         if (i2c_master_bus_add_device(i2c_bus_handle, &cfg, &dev) == ESP_OK) {
             esp_err_t ret = i2c_master_probe(i2c_bus_handle, addr, I2C_SCAN_TIMEOUT_MS);
+            i2c_master_bus_rm_device(dev);
             if (ret == ESP_OK) {
                 lua_pushinteger(L, addr);
                 lua_rawseti(L, -2, ++found);
             }
-            i2c_master_bus_rm_device(dev);
         }
     }
     return 1;
@@ -544,14 +683,140 @@ static int l_i2c_scan(lua_State *L)
 #define SPI_WRITE_BUF_SZ 4096
 #define SPI_READ_BUF_SZ 4096
 #define SPI_TIMEOUT_MS  1000
+#define SPI_MIN_FREQ_HZ 100000
+#define SPI_MAX_FREQ_HZ 40000000
 
 static spi_device_handle_t spi_handle = NULL;
 static int spi_dc_pin = -1;
 static int spi_res_pin = -1;
 static bool spi_bus_initialized = false;
+static int spi_bus_mosi_pin = -1;
+static int spi_bus_clk_pin = -1;
+static int spi_bus_max_transfer_sz = 0;
+
+/* Keep SPI frequency limits consistent across spi.setup and lcd.setup. */
+/*
+ * 统一裁剪 SPI 频率范围。
+ *
+ * 这样 spi.setup 和 lcd.setup 不会各自维护一套上下限逻辑，
+ * 后续调整频率范围时也只需要改一个地方。
+ */
+static int clamp_spi_freq(int freq)
+{
+    if (freq > SPI_MAX_FREQ_HZ) {
+        return SPI_MAX_FREQ_HZ;
+    }
+    if (freq < SPI_MIN_FREQ_HZ) {
+        return SPI_MIN_FREQ_HZ;
+    }
+    return freq;
+}
+
+static bool is_optional_output_gpio(int pin)
+{
+    return pin < 0 || GPIO_IS_VALID_OUTPUT_GPIO(pin);
+}
+
+/*
+ * 释放 spi.* Lua API 使用的通用 SPI device 句柄。
+ *
+ * 这里只释放“设备”，不释放“总线”。
+ * 因为总线可能还会被 LCD 或后续的 SPI 设备继续复用。
+ */
+static esp_err_t spi_remove_device(void)
+{
+    if (!spi_handle) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = spi_bus_remove_device(spi_handle);
+    if (ret == ESP_OK) {
+        spi_handle = NULL;
+    }
+    return ret;
+}
+
+/*
+ * 确保共享 SPI 总线满足当前请求。
+ *
+ * 这个函数负责处理“是否需要复用已有总线”以及“是否必须重建总线”。
+ *
+ * 触发重建的条件：
+ * 1. MOSI 引脚变了
+ * 2. CLK 引脚变了
+ * 3. 新请求需要更大的 max_transfer_sz，而当前总线不够用
+ *
+ * 只有在已有总线无法满足新请求时，才会真正执行 spi_bus_free + spi_bus_initialize。
+ */
+static esp_err_t spi_ensure_bus(int mosi, int clk, int max_transfer_sz)
+{
+    bool needs_reinit = false;
+
+    /*
+     * 如果当前总线已经初始化，就比较“当前配置”和“目标配置”是否兼容。
+     * 不兼容才需要重建。
+     */
+    if (spi_bus_initialized) {
+        needs_reinit = (spi_bus_mosi_pin != mosi) ||
+                       (spi_bus_clk_pin != clk) ||
+                       (spi_bus_max_transfer_sz < max_transfer_sz);
+    }
+
+    if (needs_reinit) {
+        /*
+         * 释放底层 SPI bus。
+         * 注意：调用这个函数前，上层应先确保设备句柄已被移除。
+         */
+        esp_err_t ret = spi_bus_free(SPI2_HOST);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        /*
+         * 释放成功后，把本地缓存状态一起清空。
+         * 这样后续会进入重新初始化流程。
+         */
+        spi_bus_initialized = false;
+        spi_bus_mosi_pin = -1;
+        spi_bus_clk_pin = -1;
+        spi_bus_max_transfer_sz = 0;
+    }
+
+    if (!spi_bus_initialized) {
+        /*
+         * 创建新的 SPI bus 配置。
+         * 这里只配置总线级别的引脚与最大传输能力，
+         * 具体设备参数由 spi.setup 或 lcd.setup 各自继续补充。
+         */
+        spi_bus_config_t bus_cfg = {
+            .mosi_io_num = mosi,
+            .miso_io_num = -1,
+            .sclk_io_num = clk,
+            .quadwp_io_num = -1,
+            .quadhd_io_num = -1,
+            .max_transfer_sz = max_transfer_sz,
+        };
+
+        esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        /*
+         * 初始化成功后，记录当前总线的实际配置，
+         * 供后续复用判断使用。
+         */
+        spi_bus_initialized = true;
+        spi_bus_mosi_pin = mosi;
+        spi_bus_clk_pin = clk;
+        spi_bus_max_transfer_sz = max_transfer_sz;
+    }
+
+    return ESP_OK;
+}
 
 static int l_spi_setup(lua_State *L)
 {
+    /* 参数依次为 MOSI、CLK、CS、DC、RES、频率。 */
     int mosi = luaL_checkinteger(L, 1);
     int clk = luaL_checkinteger(L, 2);
     int cs = luaL_optinteger(L, 3, -1);
@@ -559,19 +824,43 @@ static int l_spi_setup(lua_State *L)
     int res = luaL_optinteger(L, 5, -1);
     int freq = luaL_optinteger(L, 6, 1000000);
 
-    if (spi_handle) {
-        spi_bus_remove_device(spi_handle);
-        spi_handle = NULL;
+    /* MOSI 和 CLK 必须是合法输出引脚。 */
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(mosi)) {
+        return luaL_error(L, "spi.setup invalid MOSI pin: %d", mosi);
+    }
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(clk)) {
+        return luaL_error(L, "spi.setup invalid CLK pin: %d", clk);
+    }
+    /* CS / DC / RES 允许不传；如果传了，就必须是合法输出引脚。 */
+    if (!is_optional_output_gpio(cs)) {
+        return luaL_error(L, "spi.setup invalid CS pin: %d", cs);
+    }
+    if (!is_optional_output_gpio(dc)) {
+        return luaL_error(L, "spi.setup invalid DC pin: %d", dc);
+    }
+    if (!is_optional_output_gpio(res)) {
+        return luaL_error(L, "spi.setup invalid RES pin: %d", res);
+    }
+    /* 把频率裁剪到统一允许范围。 */
+    freq = clamp_spi_freq(freq);
+
+    /* 如果此前存在普通 SPI 设备句柄，先移除。 */
+    esp_err_t ret = spi_remove_device();
+    if (ret != ESP_OK) {
+        return luaL_error(L, "spi.setup remove device failed: %s", esp_err_to_name(ret));
     }
 
+    /* 保存当前 DC / RES 引脚，供 spi.write / spi.dc 复用。 */
     spi_dc_pin = dc;
     spi_res_pin = res;
 
+    /* 如果配置了 DC 引脚，就先初始化为输出，并默认拉低表示命令态。 */
     if (dc >= 0) {
         gpio_set_direction(dc, GPIO_MODE_OUTPUT);
         gpio_set_level(dc, 0);  /* DC=0 for command mode initially */
         ESP_LOGI(TAG, "SPI DC pin=%d initialized", dc);
     }
+    /* 如果配置了 RES 引脚，就执行一次简单的硬件复位脉冲。 */
     if (res >= 0) {
         gpio_set_direction(res, GPIO_MODE_OUTPUT);
         gpio_set_level(res, 1);
@@ -581,26 +870,21 @@ static int l_spi_setup(lua_State *L)
         ESP_LOGI(TAG, "SPI RES pin=%d initialized", res);
     }
 
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = mosi,
-        .miso_io_num = -1,
-        .sclk_io_num = clk,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = SPI_WRITE_BUF_SZ,
-    };
-
-    if (!spi_bus_initialized) {
-        esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-        if (ret != ESP_OK) {
-            return luaL_error(L, "spi.setup bus failed: %s", esp_err_to_name(ret));
-        }
-        spi_bus_initialized = true;
-    } else {
-        ESP_LOGW(TAG, "SPI bus already initialized, reusing");
+    /* 先判断当前 bus 是否可以直接复用，便于后面打日志。 */
+    bool reuse_bus = spi_bus_initialized &&
+                     spi_bus_mosi_pin == mosi &&
+                     spi_bus_clk_pin == clk &&
+                     spi_bus_max_transfer_sz >= SPI_WRITE_BUF_SZ;
+    /* 确保底层 SPI bus 已经准备好，必要时自动重建。 */
+    ret = spi_ensure_bus(mosi, clk, SPI_WRITE_BUF_SZ);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "spi.setup bus failed: %s", esp_err_to_name(ret));
+    }
+    if (reuse_bus) {
+        ESP_LOGD(TAG, "SPI bus already initialized, reusing");
     }
 
-    esp_err_t ret;
+    /* 这里配置的是“设备级”参数，而不是 bus 级参数。 */
     spi_device_interface_config_t dev_cfg = {
         .command_bits = 0,
         .address_bits = 0,
@@ -616,6 +900,7 @@ static int l_spi_setup(lua_State *L)
         .queue_size = 1,
     };
 
+    /* 把这个 SPI 设备挂到已经准备好的 SPI2_HOST 总线上。 */
     ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle);
     if (ret != ESP_OK) {
         return luaL_error(L, "spi.setup add device failed: %s", esp_err_to_name(ret));
@@ -626,36 +911,22 @@ static int l_spi_setup(lua_State *L)
 
 static int l_spi_transfer(lua_State *L)
 {
+    /* transfer 需要先完成 spi.setup。 */
     if (!spi_handle) {
         return luaL_error(L, "spi not initialized");
     }
 
+    /* 获取全部入参个数，这里所有参数都被视为待发送数据。 */
     int nargs = lua_gettop(L);
     uint8_t tx_buf[SPI_WRITE_BUF_SZ];
-    int tx_len = 0;
+    /* 把 Lua 参数展开成连续发送缓冲区。 */
+    int tx_len = lua_build_byte_buffer(L, 1, nargs, tx_buf, SPI_WRITE_BUF_SZ);
 
-    for (int i = 1; i <= nargs && tx_len < SPI_WRITE_BUF_SZ; i++) {
-        if (lua_isinteger(L, i)) {
-            tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, i);
-        } else if (lua_isstring(L, i)) {
-            size_t slen;
-            const char *s = lua_tolstring(L, i, &slen);
-            for (size_t j = 0; j < slen && tx_len < SPI_WRITE_BUF_SZ; j++) {
-                tx_buf[tx_len++] = (uint8_t)s[j];
-            }
-        } else if (lua_istable(L, i)) {
-            int tlen = luaL_len(L, i);
-            for (int j = 1; j <= tlen && tx_len < SPI_WRITE_BUF_SZ; j++) {
-                lua_rawgeti(L, i, j);
-                tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, -1);
-                lua_pop(L, 1);
-            }
-        }
-    }
-
+    /* 这里做全双工传输，接收长度与发送长度保持一致。 */
     int rx_len = tx_len;
     uint8_t rx_buf[SPI_READ_BUF_SZ];
 
+    /* 配置一次同步 SPI 事务。length/rxlength 单位都是 bit。 */
     spi_transaction_t t = {
         .tx_buffer = tx_buf,
         .rx_buffer = rx_buf,
@@ -663,11 +934,13 @@ static int l_spi_transfer(lua_State *L)
         .rxlength = rx_len * 8,
     };
 
+    /* 发起同步传输。 */
     esp_err_t ret = spi_device_transmit(spi_handle, &t);
     if (ret != ESP_OK) {
         return luaL_error(L, "spi.transfer failed: %s", esp_err_to_name(ret));
     }
 
+    /* 把收到的字节流转换成 Lua table 返回。 */
     lua_createtable(L, rx_len, 0);
     for (int i = 0; i < rx_len; i++) {
         lua_pushinteger(L, rx_buf[i]);
@@ -678,45 +951,36 @@ static int l_spi_transfer(lua_State *L)
 
 static int l_spi_write(lua_State *L)
 {
+    /* write 需要先完成 spi.setup。 */
     if (!spi_handle) {
         return luaL_error(L, "spi not initialized");
     }
 
+    /*
+     * 第 1 个参数默认解释为 DC 电平：
+     * - 0：命令
+     * - 1：数据
+     */
     int dc_value = luaL_optinteger(L, 1, 1);
     int nargs = lua_gettop(L);
 
+    /* 如果配置过 DC 引脚，就在发送前先切换电平。 */
     if (spi_dc_pin >= 0) {
         gpio_set_level(spi_dc_pin, dc_value);
         ESP_LOGD(TAG, "spi.write: dc_pin=%d value=%d", spi_dc_pin, dc_value);
     }
 
     uint8_t tx_buf[SPI_WRITE_BUF_SZ];
-    int tx_len = 0;
+    /* 从第 2 个参数开始才是真正要发出去的数据。 */
+    int tx_len = lua_build_byte_buffer(L, 2, nargs, tx_buf, SPI_WRITE_BUF_SZ);
 
-    for (int i = 2; i <= nargs && tx_len < SPI_WRITE_BUF_SZ; i++) {
-        if (lua_isinteger(L, i)) {
-            tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, i);
-        } else if (lua_isstring(L, i)) {
-            size_t slen;
-            const char *s = lua_tolstring(L, i, &slen);
-            for (size_t j = 0; j < slen && tx_len < SPI_WRITE_BUF_SZ; j++) {
-                tx_buf[tx_len++] = (uint8_t)s[j];
-            }
-        } else if (lua_istable(L, i)) {
-            int tlen = luaL_len(L, i);
-            for (int j = 1; j <= tlen && tx_len < SPI_WRITE_BUF_SZ; j++) {
-                lua_rawgeti(L, i, j);
-                tx_buf[tx_len++] = (uint8_t)lua_tointeger(L, -1);
-                lua_pop(L, 1);
-            }
-        }
-    }
-
+    /* write 是纯发送事务，不关心返回数据。 */
     spi_transaction_t t = {
         .tx_buffer = tx_buf,
         .length = tx_len * 8,
     };
 
+    /* 执行同步发送。 */
     esp_err_t ret = spi_device_transmit(spi_handle, &t);
     if (ret != ESP_OK) {
         return luaL_error(L, "spi.write failed: %s", esp_err_to_name(ret));
@@ -783,6 +1047,43 @@ static void fb_clear_dirty(void)
     dirty_y2 = 0;
 }
 
+/*
+ * 释放 LCD panel / panel_io 相关对象。
+ *
+ * 这里故意不处理 framebuffer，
+ * 因为 panel/io 与 framebuffer 是两类不同资源：
+ * - panel/io 属于外设驱动对象
+ * - framebuffer/semaphore 属于显示缓存与同步资源
+ *
+ * 分开处理后，重试初始化或局部清理会更灵活。
+ */
+static void lcd_release_panel(void)
+{
+    if (lcd_panel_handle) {
+        esp_lcd_panel_del(lcd_panel_handle);
+        lcd_panel_handle = NULL;
+    }
+    if (lcd_io_handle) {
+        esp_lcd_panel_io_del(lcd_io_handle);
+        lcd_io_handle = NULL;
+    }
+    lcd_initialized = false;
+    lcd_dma_busy = false;
+    lcd_bl_pwm_initialized = false;
+    lcd_dc_pin = -1;
+    lcd_cs_pin = -1;
+    lcd_res_pin = -1;
+    fb_clear_dirty();
+}
+
+/*
+ * 释放 LCD 相关缓存资源。
+ *
+ * 这里主要负责：
+ * 1. 释放 DMA framebuffer
+ * 2. 释放 flush 同步信号量
+ * 3. 重置 DMA busy 和 dirty 区域状态
+ */
 static void lcd_free_buffers(void)
 {
     if (lcd_framebuf) {
@@ -793,6 +1094,8 @@ static void lcd_free_buffers(void)
         vSemaphoreDelete(lcd_flush_sem);
         lcd_flush_sem = NULL;
     }
+    lcd_dma_busy = false;
+    fb_clear_dirty();
 }
 
 static bool fb_has_dirty(void)
@@ -999,6 +1302,7 @@ static void fb_draw_char(int x, int y, char c, uint16_t fg, int has_bg, uint16_t
 
 static int l_lcd_setup(lua_State *L)
 {
+    /* 参数依次为 MOSI、CLK、CS、DC、RES、BL、频率。 */
     int mosi = luaL_checkinteger(L, 1);
     int clk = luaL_checkinteger(L, 2);
     int cs = luaL_optinteger(L, 3, -1);
@@ -1007,42 +1311,64 @@ static int l_lcd_setup(lua_State *L)
     int bl = luaL_optinteger(L, 6, 11);
     int freq = luaL_optinteger(L, 7, 20000000);
 
+    /* LCD 基于 SPI，所以这些引脚都要求是合法输出引脚。 */
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(mosi)) {
+        return luaL_error(L, "lcd.setup invalid MOSI pin: %d", mosi);
+    }
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(clk)) {
+        return luaL_error(L, "lcd.setup invalid CLK pin: %d", clk);
+    }
+    if (!is_optional_output_gpio(cs)) {
+        return luaL_error(L, "lcd.setup invalid CS pin: %d", cs);
+    }
+    if (!is_optional_output_gpio(dc)) {
+        return luaL_error(L, "lcd.setup invalid DC pin: %d", dc);
+    }
+    if (!is_optional_output_gpio(res)) {
+        return luaL_error(L, "lcd.setup invalid RES pin: %d", res);
+    }
+    if (!is_optional_output_gpio(bl)) {
+        return luaL_error(L, "lcd.setup invalid BL pin: %d", bl);
+    }
+    /* 对 LCD SPI 时钟做统一裁剪。 */
+    freq = clamp_spi_freq(freq);
+
+    /* 记录 LCD 引脚配置，后续亮度/刷新流程可能会用到。 */
     lcd_cs_pin = cs;
     lcd_dc_pin = dc;
     lcd_res_pin = res;
     lcd_bl_pin = bl;
 
+    /* 打印一次完整配置，方便串口日志排查。 */
     ESP_LOGI(TAG, "ST7735: mosi=%d clk=%d cs=%d dc=%d res=%d bl=%d freq=%d", mosi, clk, cs, dc, res, bl, freq);
 
-    if (lcd_panel_handle) {
-        esp_lcd_panel_del(lcd_panel_handle);
-        lcd_panel_handle = NULL;
-    }
-    if (lcd_io_handle) {
-        esp_lcd_panel_io_del(lcd_io_handle);
-        lcd_io_handle = NULL;
+    /*
+     * LCD 和普通 SPI API 共用 SPI bus。
+     * 所以这里先把 spi.* 可能残留的通用 device 句柄移除掉。
+     */
+    esp_err_t ret = spi_remove_device();
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup remove spi device failed: %s", esp_err_to_name(ret));
     }
 
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = mosi,
-        .miso_io_num = GPIO_NUM_NC,
-        .sclk_io_num = clk,
-        .quadwp_io_num = GPIO_NUM_NC,
-        .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2,
-    };
+    /* 再释放旧的 LCD panel / io 对象，准备重新初始化。 */
+    lcd_release_panel();
 
-    if (!spi_bus_initialized) {
-        esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-        if (ret != ESP_OK) {
-            return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
-        }
-        spi_bus_initialized = true;
-    } else {
+    /* 判断当前 SPI bus 是否可以直接复用。 */
+    bool reuse_bus = spi_bus_initialized &&
+                     spi_bus_mosi_pin == mosi &&
+                     spi_bus_clk_pin == clk &&
+                     spi_bus_max_transfer_sz >= LCD_WIDTH * LCD_HEIGHT * 2;
+    /* 确保 LCD 所需的底层 SPI bus 已准备完成。 */
+    ret = spi_ensure_bus(mosi, clk, LCD_WIDTH * LCD_HEIGHT * 2);
+    if (ret != ESP_OK) {
+        return luaL_error(L, "lcd.setup bus failed: %s", esp_err_to_name(ret));
+    }
+    if (reuse_bus) {
         ESP_LOGW(TAG, "ST7735: SPI bus already initialized, reusing");
     }
 
-    esp_err_t ret;
+    /* 配置 LCD 的 panel_io，也就是 LCD 命令/参数传输层。 */
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num = dc,
         .cs_gpio_num = cs,
@@ -1055,16 +1381,20 @@ static int l_lcd_setup(lua_State *L)
         .user_ctx = NULL,
     };
 
+    /* 创建 SPI 版 LCD panel_io。 */
     ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &lcd_io_handle);
     if (ret != ESP_OK) {
+        lcd_release_panel();
         return luaL_error(L, "lcd.setup panel io failed: %s", esp_err_to_name(ret));
     }
 
+    /* 提供 ST7735 的上电初始化命令表。 */
     st7735_vendor_config_t vendor_config = {
         .init_cmds = st7735_init_cmds,
         .init_cmds_size = sizeof(st7735_init_cmds) / sizeof(st7735_lcd_init_cmd_t),
     };
 
+    /* 配置 LCD panel 实例。 */
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = res,
         .data_endian = LCD_RGB_DATA_ENDIAN_BIG,
@@ -1073,26 +1403,36 @@ static int l_lcd_setup(lua_State *L)
         .vendor_config = &vendor_config,
     };
 
+    /* 创建 ST7735 panel 对象。 */
     ret = esp_lcd_new_panel_st7735(lcd_io_handle, &panel_cfg, &lcd_panel_handle);
     if (ret != ESP_OK) {
+        lcd_release_panel();
         return luaL_error(L, "lcd.setup panel failed: %s", esp_err_to_name(ret));
     }
 
+    /* 按顺序执行 LCD 硬复位、初始化、设置显示偏移。 */
     ret = esp_lcd_panel_reset(lcd_panel_handle);
     if (ret != ESP_OK) {
+        lcd_release_panel();
         return luaL_error(L, "lcd.setup reset failed: %s", esp_err_to_name(ret));
     }
 
     ret = esp_lcd_panel_init(lcd_panel_handle);
     if (ret != ESP_OK) {
+        lcd_release_panel();
         return luaL_error(L, "lcd.setup init failed: %s", esp_err_to_name(ret));
     }
 
     ret = esp_lcd_panel_set_gap(lcd_panel_handle, 0, 24);
     if (ret != ESP_OK) {
+        lcd_release_panel();
         return luaL_error(L, "lcd.setup set gap failed: %s", esp_err_to_name(ret));
     }
 
+    /*
+     * 初始化背光控制。
+     * 优先尝试 PWM 调光；如果失败，就回退到普通 GPIO 开关模式。
+     */
     if (lcd_bl_pin >= 0) {
         ledc_channel_config_t ledc_conf = {
             .channel = LEDC_CHANNEL_0,
@@ -1136,19 +1476,27 @@ static int l_lcd_setup(lua_State *L)
         }
     }
 
+    /*
+     * 如果还没有创建 framebuffer / semaphore，就在这里分配。
+     * framebuffer 使用 DMA-capable 内存，便于后续直接刷屏。
+     */
     if (lcd_framebuf == NULL) {
         lcd_flush_sem = xSemaphoreCreateBinary();
         if (lcd_flush_sem == NULL) {
+            lcd_release_panel();
             return luaL_error(L, "lcd.setup: semaphore create failed");
         }
         lcd_framebuf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
         if (lcd_framebuf == NULL) {
             ESP_LOGE(TAG, "Failed to allocate frame buffer");
+            lcd_free_buffers();
+            lcd_release_panel();
             return luaL_error(L, "lcd.setup: frame buffer allocation failed");
         }
         memset(lcd_framebuf, 0, LCD_WIDTH * LCD_HEIGHT * 2);
     }
 
+    /* 到这里说明 LCD 所需对象都已准备完成。 */
     lcd_initialized = true;
     ESP_LOGI(TAG, "ST7735 LCD initialized (single buffer: %d bytes)", LCD_WIDTH * LCD_HEIGHT * 2);
     return 0;
@@ -1276,7 +1624,7 @@ static int l_lcd_draw_pixels(lua_State *L)
         memcpy(&lcd_framebuf[dst_idx], data + src_idx, clipped_w * 2);
     }
     
-    fb_mark_dirty(clipped_x, clipped_y, clipped_x + clipped_w, clipped_y + clipped_h);
+    fb_mark_dirty(clipped_x, clipped_y, clipped_w, clipped_h);
     return 0;
 }
 
@@ -1294,7 +1642,10 @@ static int l_lcd_flush(lua_State *L)
     }
 
     if (lcd_dma_busy && lcd_flush_sem) {
-        xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100));
+        if (xSemaphoreTake(lcd_flush_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "LCD DMA timeout, skipping flush");
+            return 0;
+        }
     }
 
     lcd_dma_busy = true;
@@ -1501,12 +1852,10 @@ esp_err_t lua_runtime_restart(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    /* Free LCD buffers before destroying VM */
+    /* Release hardware resources before destroying VM */
     lcd_free_buffers();
-
-    /* Note: DO NOT reset spi_bus_initialized here!
-     * The SPI bus is still initialized in ESP-IDF, we just need to
-     * reuse it. The flag ensures we don't reinitialize. */
+    lcd_release_panel();
+    spi_remove_device();
 
     /* Destroy and recreate VM (task is dead, safe to access directly) */
     destroy_vm(L);
@@ -1668,8 +2017,10 @@ esp_err_t lua_runtime_get_memory_usage(uint32_t *current_bytes, uint32_t *peak_b
         return ESP_ERR_INVALID_STATE;
     }
 
+    taskENTER_CRITICAL(&lua_mem_mux);
     *current_bytes = lua_mem_current;
     *peak_bytes = lua_mem_peak;
+    taskEXIT_CRITICAL(&lua_mem_mux);
     return ESP_OK;
 }
 

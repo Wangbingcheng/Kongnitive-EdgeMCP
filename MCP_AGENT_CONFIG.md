@@ -55,6 +55,28 @@ curl -X POST http://192.168.1.31/mcp \
 3. `lua_list_scripts`
 4. `sys_get_logs`
 
+## Recommended External MCP Servers
+
+### Espressif Documentation
+
+Provides semantic search across ESP-IDF, ESP-AT, Arduino-ESP32, and other Espressif frameworks.
+
+- **URL**: `https://mcp.espressif.com/docs`
+
+#### Add to Claude Code
+
+```bash
+claude mcp add --transport http espressif-documentation https://mcp.espressif.com/docs
+```
+
+#### Add to Codex (config.toml)
+
+```toml
+[mcp_servers.espressif-documentation]
+type = "http"
+url = "https://mcp.espressif.com/docs"
+```
+
 ## Available Tools (14)
 
 - `control_led`

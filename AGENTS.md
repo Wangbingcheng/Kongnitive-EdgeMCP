@@ -10,6 +10,13 @@ Kongnitive EdgeMCP is an ESP32 MCP server with an embedded Lua 5.4 runtime. AI a
 - **Framework**: ESP-IDF v5.0+
 - **Target Hardware**: ESP32 (verified: Seeed Studio XIAO ESP32S3)
 
+## Recommended Tools
+
+### Espressif Documentation MCP Server
+For any questions regarding ESP-IDF APIs, hardware specifics, or Espressif frameworks, use the official Espressif Documentation MCP server:
+- **URL**: `https://mcp.espressif.com/docs`
+- **Capability**: Semantic search across all Espressif documentation.
+
 ## Build Commands
 
 ### ESP-IDF Version
