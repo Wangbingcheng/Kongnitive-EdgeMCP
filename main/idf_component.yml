@@ -14,4 +14,4 @@ dependencies:
   #   # `public` flag doesn't have an effect dependencies of the `main` component.
   #   # All dependencies of `main` are public by default.
   #   public: true
-  espressif/cJSON: ^1.7.0
+  espressif/cjson: ^1.7.19~2
